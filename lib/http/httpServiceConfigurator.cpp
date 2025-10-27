@@ -130,10 +130,10 @@ std::map<std::string, std::string> fnHttpServiceConfigurator::parse_postdata(con
 void udpstream_activate()
 {
 #ifdef BUILD_ATARI
-    SIO.setUDPHost(Config.get_network_udpstream_host().c_str(), Config.get_network_udpstream_port());
+    SYSTEM_BUS.setUDPHost(Config.get_network_udpstream_host().c_str(), Config.get_network_udpstream_port());
 #endif /* ATARI */
 #ifdef BUILD_LYNX
-    ComLynx.setUDPHost(Config.get_network_udpstream_host().c_str(), Config.get_network_udpstream_port());
+    SYSTEM_BUS.setUDPHost(Config.get_network_udpstream_host().c_str(), Config.get_network_udpstream_port());
 #endif /* LYNX */
 }
 
@@ -163,7 +163,7 @@ void fnHttpServiceConfigurator::config_hsio(std::string hsioindex)
     }
 #endif
 
-    SIO.setHighSpeedIndex(index);
+    SYSTEM_BUS.setHighSpeedIndex(index);
     // Store our change in Config
     Config.store_general_hsioindex(index);
     Config.save();
@@ -306,7 +306,7 @@ void fnHttpServiceConfigurator::config_cassette_rewind()
 {
 #ifdef BUILD_ATARI
     Debug_printf("Rewinding cassette.\n");
-    SIO.getCassette()->rewind();
+    SYSTEM_BUS.getCassette()->rewind();
 
     Config.save();
 #endif /* ATARI */
@@ -322,10 +322,10 @@ void fnHttpServiceConfigurator::config_udpstream(std::string hostname)
     {
         Debug_println("UDPStream Stop Request");
 #ifdef BUILD_ATARI
-        SIO.setUDPHost("STOP", port);
+        SYSTEM_BUS.setUDPHost("STOP", port);
 #endif /* ATARI */
 #ifdef BUILD_LYNX
-        ComLynx.setUDPHost("STOP", port);
+        SYSTEM_BUS.setUDPHost("STOP", port);
 #endif /* LYNX */
         Config.store_udpstream_host("");
         Config.store_udpstream_port(0);
@@ -442,7 +442,7 @@ void fnHttpServiceConfigurator::config_printer_port(std::string printernumber, s
     fnPrinters.set_port(0, port);
 #ifdef BUILD_ATARI
     // Tell the SIO daisy chain to change the device ID for this printer
-    SIO.changeDeviceId(fnPrinters.get_ptr(0), SIO_DEVICEID_PRINTER + port);
+    SYSTEM_BUS.changeDeviceId(fnPrinters.get_ptr(0), SIO_DEVICEID_PRINTER + port);
 #endif
 
     Config.save();
@@ -544,6 +544,7 @@ void fnHttpServiceConfigurator::config_serial(std::string port, std::string baud
     {
         Config.save();
 
+#ifdef UNUSED
 #if defined(BUILD_ATARI)
         if (fnSioCom.get_sio_mode() == SioCom::sio_mode::SERIAL)
         {
@@ -570,6 +571,7 @@ void fnHttpServiceConfigurator::config_serial(std::string port, std::string baud
             fnDwCom.begin(Config.get_serial_baud());
         }
 #endif
+#endif /* UNUSED */
     }
 }
 #elif defined(BUILD_RS232)
@@ -614,7 +616,7 @@ void fnHttpServiceConfigurator::config_boip(std::string enable_boip, std::string
     // Update settings (on ESP reboot is needed)
 #ifndef ESP_PLATFORM
 #if defined(BUILD_ATARI)
-    fnSioCom.set_netsio_host(Config.get_boip_host().c_str(), Config.get_boip_port());
+    SYSTEM_BUS.set_netsio_host(Config.get_boip_host().c_str(), Config.get_boip_port());
 #elif defined(BUILD_COCO)
     fnDwCom.set_becker_host(Config.get_boip_host().c_str(), Config.get_boip_port());
 #endif
@@ -628,7 +630,7 @@ void fnHttpServiceConfigurator::config_boip(std::string enable_boip, std::string
     // Apply settings (on ESP reboot is needed)
 #ifndef ESP_PLATFORM
 #if defined(BUILD_ATARI)
-    fnSioCom.reset_sio_port(Config.get_boip_enabled() ? SioCom::sio_mode::NETSIO : SioCom::sio_mode::SERIAL);
+    SYSTEM_BUS.reset_sio_port(Config.get_boip_enabled() ? SioCom::sio_mode::NETSIO : SioCom::sio_mode::SERIAL);
 #elif defined(BUILD_COCO)
     fnDwCom.reset_drivewire_port(Config.get_boip_enabled() ? DwCom::dw_mode::BECKER : DwCom::dw_mode::SERIAL);
 #endif

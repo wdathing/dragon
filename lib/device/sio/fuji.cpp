@@ -43,6 +43,8 @@
 
 sioFuji theFuji; // global fuji device object
 
+//QRManager sioFuji::_qrManager = QRManager();
+
 #ifdef ESP_PLATFORM
 std::unique_ptr<sioNetwork, PSRAMDeleter<sioNetwork>> sioNetDevs[MAX_NETWORK_DEVICES];
 #else
@@ -317,7 +319,7 @@ void sioFuji::sio_net_get_wifi_enabled()
 // Set SIO baudrate
 void sioFuji::sio_set_baudrate()
 {
-   
+
     int br = 0;
 
     switch(cmdFrame.aux1) {
@@ -354,18 +356,15 @@ void sioFuji::sio_set_baudrate()
             sio_error();
             return;
     }
-  
+
     // send complete with current baudrate
     sio_complete();
 
-#ifdef ESP_PLATFORM
-    SYSTEM_BUS.uart->flush();
-    SYSTEM_BUS.uart->set_baudrate(br);
-#else
-    fnSioCom.flush();
+    SYSTEM_BUS.flush();
+#ifndef ESP_PLATFORM
     fnSystem.delay_microseconds(2000);
-    fnSioCom.set_baudrate(br);
 #endif
+    SYSTEM_BUS.setBaudrate(br);
 }
 
 // Mount Server
@@ -650,9 +649,9 @@ void sioFuji::sio_copy_file()
     do
     {
 #ifndef ESP_PLATFORM
-        if (fnSioCom.get_sio_mode() == SioCom::sio_mode::NETSIO && fnSystem.millis() - poll_ts > 1000)
+        if (SYSTEM_BUS.get_sio_mode() == SioCom::sio_mode::NETSIO && fnSystem.millis() - poll_ts > 1000)
         {
-            fnSioCom.poll(1);
+            SYSTEM_BUS.poll(1);
             poll_ts = fnSystem.millis();
         }
 #endif
@@ -959,8 +958,8 @@ void sioFuji::sio_read_app_key()
     fclose(fIn);
 
 #ifdef DEBUG
-	std::string msg = util_hexdump(response_data.data(), appkey_size);
-	Debug_printf("\n%s\n", msg.c_str());
+        std::string msg = util_hexdump(response_data.data(), appkey_size);
+        Debug_printf("\n%s\n", msg.c_str());
 #endif
 
     bus_to_computer(response_data.data(), response_data.size(), false);
@@ -1082,12 +1081,12 @@ void sioFuji::image_rotate()
         {
             int swap = _fnDisks[n - 1].disk_dev.id();
             Debug_printf("setting slot %d to ID %x\n", n, swap);
-            _sio_bus->changeDeviceId(&_fnDisks[n].disk_dev, swap);
+            SYSTEM_BUS.changeDeviceId(&_fnDisks[n].disk_dev, swap);
         }
 
         // The first slot gets the device ID of the last slot
         Debug_printf("setting slot %d to ID %x\n", 0, last_id);
-        _sio_bus->changeDeviceId(&_fnDisks[0].disk_dev, last_id);
+        SYSTEM_BUS.changeDeviceId(&_fnDisks[0].disk_dev, last_id);
 
         // Say whatever disk is in D1:
         if (Config.get_general_rotation_sounds())
@@ -1208,23 +1207,23 @@ void _set_additional_direntry_details(fsdir_entry_t *f, uint8_t *dest, uint8_t m
 
 /*
  * Read directory entries in block mode
- * 
+ *
  * Input parameters:
  * aux1: Number of 256-byte pages to return (determines maximum response size)
  * aux2: Lower 6 bits define the number of entries per page group
- * 
+ *
  * Response format:
  * Overall response header:
  * Byte  0    : 'M' (Magic number byte 1)
  * Byte  1    : 'F' (Magic number byte 2)
  * Byte  2    : Header size (4)
  * Byte  3    : Number of page groups that follow
- * 
+ *
  * Followed by one or more complete PageGroups, padded to aux1 * 256 bytes.
  * Each PageGroup must fit entirely within the response - partial groups are not allowed.
  * If a PageGroup would exceed the remaining space, the directory position is rewound
  * and that group is not included.
- * 
+ *
  * PageGroup structure:
  * Byte  0    : Flags
  *              - Bit 7: Last group (1=yes, 0=no)
@@ -1243,7 +1242,7 @@ void _set_additional_direntry_details(fsdir_entry_t *f, uint8_t *dest, uint8_t m
  *              - Bytes 4-6: File size (24-bit little-endian, 0 for directories)
  *              - Byte  7  : Media type (0-255, with 0=unknown)
  *              - Bytes 8+ : Null-terminated filename
- * 
+ *
  * The last PageGroup in the response will have its last_group flag set if:
  * a) There are no more directory entries to process, or
  * b) The next PageGroup would exceed the maximum response size
@@ -1264,7 +1263,7 @@ void sioFuji::sio_read_directory_block()
     uint16_t starting_pos = _fnHosts[_current_open_directory_slot].dir_tell();
 #endif /* WE_NEED_TO_REWIND */
     // Debug_printf("Starting directory position: %d\n", starting_pos);
-    
+
     std::vector<DirectoryPageGroup> page_groups;
     size_t total_size = 0;
     bool is_last_entry = false;
@@ -1273,17 +1272,17 @@ void sioFuji::sio_read_directory_block()
         // Create a new page group
         DirectoryPageGroup group;
         uint16_t group_start_pos = _fnHosts[_current_open_directory_slot].dir_tell();
-        
+
         // Calculate group index (0-based)
         group.index = group_start_pos / group_size;
-        
-        // Debug_printf("Starting new group at directory position: %d (index=%d)\n", 
+
+        // Debug_printf("Starting new group at directory position: %d (index=%d)\n",
         //              group_start_pos, group.index);
-        
+
         // Fill the group with entries
         for (int i = 0; i < group_size && !is_last_entry; i++) {
             fsdir_entry_t *f = _fnHosts[_current_open_directory_slot].dir_nextfile();
-            
+
             if (f == nullptr) {
                 // Debug_println("Reached end of directory");
                 is_last_entry = true;
@@ -1291,9 +1290,9 @@ void sioFuji::sio_read_directory_block()
                 break;
             }
 
-            // Debug_printf("Adding entry %d: \"%s\" (size=%lu)\n", 
+            // Debug_printf("Adding entry %d: \"%s\" (size=%lu)\n",
             //             i, f->filename, f->size);
-            
+
             if (!group.add_entry(f)) {
                 // Debug_println("Failed to add entry to group");
                 break;
@@ -1313,7 +1312,7 @@ void sioFuji::sio_read_directory_block()
         size_t new_total = total_size + group.data.size();
         // Debug_printf("Group stats: entries=%d, size=%d, new_total=%d/%d\n",
         //             group.entry_count, group.data.size(), new_total, max_block_size);
-        
+
         if (new_total > max_block_size) {
             // Debug_printf("Group would exceed max_block_size (%d > %d), rewinding to pos %d\n",
             //            new_total, max_block_size, group_start_pos);
@@ -1321,11 +1320,11 @@ void sioFuji::sio_read_directory_block()
             _fnHosts[_current_open_directory_slot].dir_seek(group_start_pos);
             break;
         }
-        
+
         // Add group to our collection
         total_size = new_total;
         page_groups.push_back(std::move(group));
-        // Debug_printf("Added group %d, total_size now %d\n", 
+        // Debug_printf("Added group %d, total_size now %d\n",
         //             page_groups.size(), total_size);
     }
 
@@ -1374,7 +1373,7 @@ void sioFuji::sio_read_directory_entry()
         sio_error();
         return;
     }
-    
+
     // detect block mode in request
     if ((cmdFrame.aux2 & 0xC0) == 0xC0) {
         sio_read_directory_block();
@@ -1915,7 +1914,7 @@ void sioFuji::sio_set_hsio_index()
         return;
     }
 
-    SIO.setHighSpeedIndex(index);
+    SYSTEM_BUS.setHighSpeedIndex(index);
 
     // Go ahead and save it if AUX2 = 1
     if (cmdFrame.aux2 & 1)
@@ -2008,11 +2007,11 @@ void sioFuji::sio_set_sio_external_clock()
 
     if (speed == 0)
     {
-        SIO.setUltraHigh(false, 0);
+        SYSTEM_BUS.setUltraHigh(false, 0);
     }
     else
     {
-        SIO.setUltraHigh(true, baudRate);
+        SYSTEM_BUS.setUltraHigh(true, baudRate);
     }
 
     sio_complete();
@@ -2153,16 +2152,14 @@ void sioFuji::sio_enable_udpstream()
         sio_complete();
 
         // Start the UDP Stream
-        SIO.setUDPHost(host, port);
+        SYSTEM_BUS.setUDPHost(host, port);
     }
 }
 
 // Initializes base settings and adds our devices to the SIO bus
-void sioFuji::setup(systemBus *siobus)
+void sioFuji::setup()
 {
     // set up Fuji device
-    _sio_bus = siobus;
-
     _populate_slots_from_config();
 
     insert_boot_device(Config.get_general_boot_mode());
@@ -2175,12 +2172,12 @@ void sioFuji::setup(systemBus *siobus)
 
     // Add our devices to the SIO bus
     for (int i = 0; i < MAX_DISK_DEVICES; i++)
-        _sio_bus->addDevice(&_fnDisks[i].disk_dev, SIO_DEVICEID_DISK + i);
+        SYSTEM_BUS.addDevice(&_fnDisks[i].disk_dev, SIO_DEVICEID_DISK + i);
 
     for (int i = 0; i < MAX_NETWORK_DEVICES; i++)
-        _sio_bus->addDevice(sioNetDevs[i].get(), SIO_DEVICEID_FN_NETWORK + i);
+        SYSTEM_BUS.addDevice(sioNetDevs[i].get(), SIO_DEVICEID_FN_NETWORK + i);
 
-    _sio_bus->addDevice(&_cassetteDev, SIO_DEVICEID_CASSETTE);
+    SYSTEM_BUS.addDevice(&_cassetteDev, SIO_DEVICEID_CASSETTE);
     cassette()->set_buttons(Config.get_cassette_buttons());
     cassette()->set_pulldown(Config.get_cassette_pulldown());
 }
@@ -2206,47 +2203,41 @@ void sioFuji::sio_qrcode_input()
 
     std::vector<unsigned char> p(len);
     bus_to_peripheral(p.data(), len);
-    qrManager.in_buf += std::string((const char *)p.data(), len);
+    _qrManager.data += std::string((const char *)p.data(), len);
     sio_complete();
 }
 
 void sioFuji::sio_qrcode_encode()
 {
-    size_t out_len = 0;
-
-    qrManager.output_mode = 0;
     uint16_t aux = sio_get_aux();
-    qrManager.version = aux & 0b01111111;
-    qrManager.ecc_mode = (aux >> 8) & 0b00000011;
+    uint8_t version = aux & 0b01111111;
+    uint8_t ecc_mode = ((aux >> 8) & 0b00000011);
     bool shorten = (aux >> 12) & 0b00000001;
 
     Debug_printf("FUJI: QRCODE ENCODE\n");
-    Debug_printf("QR Version: %d, ECC: %d, Shorten: %s\n", qrManager.version, qrManager.ecc_mode, shorten ? "Y" : "N");
+    Debug_printf("QR Version: %d, ECC: %d, Shorten: %s\n", version, ecc_mode, shorten ? "Y" : "N");
 
-    std::string url = qrManager.in_buf;
+    std::string url = _qrManager.data;
 
     if (shorten) {
         url = fnHTTPD.shorten_url(url);
     }
 
-    std::vector<uint8_t> p = QRManager::encode(
-        url.c_str(),
-        url.size(),
-        qrManager.version,
-        qrManager.ecc_mode,
-        &out_len
-    );
+    _qrManager.version(version);
+    _qrManager.ecc((qr_ecc_t)ecc_mode);
+    _qrManager.output_mode = QR_OUTPUT_MODE_ATASCII;
+    _qrManager.encode();
 
-    qrManager.in_buf.clear();
+    _qrManager.data.clear();
 
-    if (!out_len)
+    if (!_qrManager.code.size())
     {
         Debug_printf("QR code encoding failed\n");
         sio_error();
         return;
     }
 
-    Debug_printf("Resulting QR code is: %u modules\n", out_len);
+    Debug_printf("Resulting QR code is: %u modules\n", _qrManager.code.size());
     sio_complete();
 }
 
@@ -2256,23 +2247,15 @@ void sioFuji::sio_qrcode_length()
     uint8_t output_mode = sio_get_aux();
     Debug_printf("Output mode: %i\n", output_mode);
 
-    size_t len = qrManager.out_buf.size();
+    size_t len = _qrManager.size();
 
     // A bit gross to have a side effect from length command, but not enough aux bytes
     // to specify version, ecc, *and* output mode for the encode command. Also can't
     // just wait for output command, because output mode determines buffer length,
-    if (len && (output_mode != qrManager.output_mode)) {
-        if (output_mode == QR_OUTPUT_MODE_BINARY) {
-            qrManager.to_binary();
-        }
-        else if (output_mode == QR_OUTPUT_MODE_ATASCII) {
-            qrManager.to_atascii();
-        }
-        else if (output_mode == QR_OUTPUT_MODE_BITMAP) {
-            qrManager.to_bitmap();
-        }
-        qrManager.output_mode = output_mode;
-        len = qrManager.out_buf.size();
+    if (len && (output_mode != _qrManager.output_mode)) {
+        _qrManager.output_mode = (ouput_mode_t)output_mode;
+        _qrManager.encode();
+        len = _qrManager.code.size();
     }
 
     uint8_t response[4] = {
@@ -2304,9 +2287,9 @@ void sioFuji::sio_qrcode_output()
         Debug_printf("Refusing to send a zero byte buffer. Aborting\n");
         return;
     }
-    else if (len > qrManager.out_buf.size())
+    else if (len > _qrManager.size())
     {
-        Debug_printf("Requested %u bytes, but buffer is only %u bytes, aborting.\n", len, qrManager.out_buf.size());
+        Debug_printf("Requested %u bytes, but buffer is only %u bytes, aborting.\n", len, _qrManager.code.size());
         return;
     }
     else
@@ -2314,11 +2297,10 @@ void sioFuji::sio_qrcode_output()
         Debug_printf("Requested %u bytes\n", len);
     }
 
-    bus_to_computer(&qrManager.out_buf[0], len, false);
+    bus_to_computer(&_qrManager.code[0], len, false);
 
-    qrManager.out_buf.erase(qrManager.out_buf.begin(), qrManager.out_buf.begin()+len);
-    qrManager.out_buf.shrink_to_fit();
-
+    _qrManager.code.clear();
+    _qrManager.code.shrink_to_fit();
 }
 
 
@@ -2574,7 +2556,7 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
     cmdFrame.commanddata = commanddata;
     cmdFrame.checksum = checksum;
 
-    Debug_printf("sioFuji::sio_process() called, baud: %d\n", SIO.getBaudrate());
+    Debug_printf("sioFuji::sio_process() called, baud: %d\n", SYSTEM_BUS.getBaudrate());
 
     switch (cmdFrame.comnd)
     {
