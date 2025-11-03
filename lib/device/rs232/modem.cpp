@@ -151,7 +151,7 @@ void rs232Modem::rs232_poll_3(uint8_t device, uint8_t aux1, uint8_t aux2)
         return;
     }
     // When AUX1 = 0x52 'R' and AUX == 1 or DEVICE == x050, it's a directed poll to "R1:"
-    if ((aux1 == 0x52 && aux2 == 0x01) || device == RS232_DEVICEID_RS232)
+    if ((aux1 == 0x52 && aux2 == 0x01) || device == FUJI_DEVICEID_SERIAL)
     {
         Debug_print("MODEM TYPE 4 \"R1:\" DIRECTED POLL\n");
         respond = true;
@@ -176,7 +176,7 @@ void rs232Modem::rs232_poll_3(uint8_t device, uint8_t aux1, uint8_t aux2)
     uint8_t type4response[4];
     type4response[0] = LOBYTE_FROM_UINT16(fsize);
     type4response[1] = HIBYTE_FROM_UINT16(fsize);
-    type4response[2] = RS232_DEVICEID_RS232;
+    type4response[2] = FUJI_DEVICEID_SERIAL;
     type4response[3] = 0;
 
     fnSystem.delay_microseconds(DELAY_FIRMWARE_DELIVERY);
@@ -696,7 +696,7 @@ void rs232Modem::at_cmd_println()
         SYSTEM_BUS.write(ASCII_CR);
         SYSTEM_BUS.write(ASCII_LF);
     }
-    SYSTEM_BUS.flush();
+    SYSTEM_BUS.flushOutput();
 }
 
 void rs232Modem::at_cmd_println(const char *s, bool addEol)
@@ -717,7 +717,7 @@ void rs232Modem::at_cmd_println(const char *s, bool addEol)
             SYSTEM_BUS.write(ASCII_LF);
         }
     }
-    SYSTEM_BUS.flush();
+    SYSTEM_BUS.flushOutput();
 }
 
 void rs232Modem::at_cmd_println(int i, bool addEol)
@@ -738,7 +738,7 @@ void rs232Modem::at_cmd_println(int i, bool addEol)
             SYSTEM_BUS.write(ASCII_LF);
         }
     }
-    SYSTEM_BUS.flush();
+    SYSTEM_BUS.flushOutput();
 }
 
 void rs232Modem::at_cmd_println(std::string s, bool addEol)
@@ -759,7 +759,7 @@ void rs232Modem::at_cmd_println(std::string s, bool addEol)
             SYSTEM_BUS.write(ASCII_LF);
         }
     }
-    SYSTEM_BUS.flush();
+    SYSTEM_BUS.flushOutput();
 }
 
 void rs232Modem::at_handle_wificonnect()
@@ -1025,7 +1025,7 @@ void rs232Modem::at_handle_answer()
         CRX = true;
 
         cmdMode = false;
-        SYSTEM_BUS.flush();
+        SYSTEM_BUS.flushOutput();
         answerHack = false;
     }
 }
@@ -1678,8 +1678,8 @@ void rs232Modem::rs232_handle_modem()
 
             // Read from serial, the amount available up to
             // maximum size of the buffer
-            int rs232BytesRead = SYSTEM_BUS.read(&txBuf[0], //RS232_UART.readBytes(&txBuf[0],
-                                                 (rs232BytesAvail > TX_BUF_SIZE) ? TX_BUF_SIZE : rs232BytesAvail);
+            int rs232BytesRead = SYSTEM_BUS.read(&txBuf[0], (rs232BytesAvail > TX_BUF_SIZE)
+                                                 ? TX_BUF_SIZE : rs232BytesAvail);
 
             // Disconnect if going to AT mode with "+++" sequence
             for (int i = 0; i < (int)rs232BytesRead; i++)
@@ -1729,7 +1729,7 @@ void rs232Modem::rs232_handle_modem()
             else
             {
                 SYSTEM_BUS.write(buf, bytesRead);
-                SYSTEM_BUS.flush();
+                SYSTEM_BUS.flushOutput();
             }
 
             // And dump to sniffer, if enabled.

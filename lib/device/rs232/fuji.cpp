@@ -2,8 +2,6 @@
 
 #include "fuji.h"
 
-#include <driver/ledc.h>
-
 #include <cstdint>
 #include <cstring>
 
@@ -17,6 +15,7 @@
 #include "led.h"
 #include "utils.h"
 #include "string_utils.h"
+#include "compat_string.h"
 
 rs232Fuji theFuji; // global fuji device object
 
@@ -743,11 +742,11 @@ void rs232Fuji::image_rotate()
         count--;
 
         // Save the device ID of the disk in the last slot
-        int last_id = _fnDisks[count].disk_dev.id();
+        fujiDeviceID_t last_id = _fnDisks[count].disk_dev.id();
 
         for (int n = count; n > 0; n--)
         {
-            int swap = _fnDisks[n - 1].disk_dev.id();
+            fujiDeviceID_t swap = _fnDisks[n - 1].disk_dev.id();
             Debug_printf("setting slot %d to ID %hx\n", n, swap);
             SYSTEM_BUS.changeDeviceId(&_fnDisks[n].disk_dev, swap);
         }
@@ -1474,10 +1473,11 @@ void rs232Fuji::setup()
 
     // Add our devices to the RS232 bus
     for (int i = 0; i < MAX_DISK_DEVICES; i++)
-        SYSTEM_BUS.addDevice(&_fnDisks[i].disk_dev, RS232_DEVICEID_DISK + i);
+        SYSTEM_BUS.addDevice(&_fnDisks[i].disk_dev, (fujiDeviceID_t) (FUJI_DEVICEID_DISK + i));
 
     for (int i = 0; i < MAX_NETWORK_DEVICES; i++)
-        SYSTEM_BUS.addDevice(&rs232NetDevs[i], RS232_DEVICEID_FN_NETWORK + i);
+        SYSTEM_BUS.addDevice(&rs232NetDevs[i],
+                             (fujiDeviceID_t) (FUJI_DEVICEID_NETWORK + i));
 
 }
 

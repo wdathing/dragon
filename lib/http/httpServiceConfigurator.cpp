@@ -442,7 +442,8 @@ void fnHttpServiceConfigurator::config_printer_port(std::string printernumber, s
     fnPrinters.set_port(0, port);
 #ifdef BUILD_ATARI
     // Tell the SIO daisy chain to change the device ID for this printer
-    SYSTEM_BUS.changeDeviceId(fnPrinters.get_ptr(0), SIO_DEVICEID_PRINTER + port);
+    SYSTEM_BUS.changeDeviceId(fnPrinters.get_ptr(0),
+                              (fujiDeviceID_t) (FUJI_DEVICEID_PRINTER + port));
 #endif
 
     Config.save();
@@ -615,10 +616,8 @@ void fnHttpServiceConfigurator::config_boip(std::string enable_boip, std::string
 
     // Update settings (on ESP reboot is needed)
 #ifndef ESP_PLATFORM
-#if defined(BUILD_ATARI)
-    SYSTEM_BUS.set_netsio_host(Config.get_boip_host().c_str(), Config.get_boip_port());
-#elif defined(BUILD_COCO)
-    fnDwCom.set_becker_host(Config.get_boip_host().c_str(), Config.get_boip_port());
+#if defined(BUILD_ATARI) || defined(BUILD_COCO)
+    SYSTEM_BUS.setHost(Config.get_boip_host().c_str(), Config.get_boip_port());
 #endif
 #endif
 
@@ -629,10 +628,8 @@ void fnHttpServiceConfigurator::config_boip(std::string enable_boip, std::string
 
     // Apply settings (on ESP reboot is needed)
 #ifndef ESP_PLATFORM
-#if defined(BUILD_ATARI)
-    SYSTEM_BUS.reset_sio_port(Config.get_boip_enabled() ? SioCom::sio_mode::NETSIO : SioCom::sio_mode::SERIAL);
-#elif defined(BUILD_COCO)
-    fnDwCom.reset_drivewire_port(Config.get_boip_enabled() ? DwCom::dw_mode::BECKER : DwCom::dw_mode::SERIAL);
+#if defined(BUILD_ATARI) ||  defined(BUILD_COCO)
+    SYSTEM_BUS.selectSerialPort(Config.get_boip_enabled() == 0);
 #endif
 #endif
 

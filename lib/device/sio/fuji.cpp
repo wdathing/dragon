@@ -360,7 +360,7 @@ void sioFuji::sio_set_baudrate()
     // send complete with current baudrate
     sio_complete();
 
-    SYSTEM_BUS.flush();
+    SYSTEM_BUS.flushOutput();
 #ifndef ESP_PLATFORM
     fnSystem.delay_microseconds(2000);
 #endif
@@ -648,13 +648,6 @@ void sioFuji::sio_copy_file()
     bool err = false;
     do
     {
-#ifndef ESP_PLATFORM
-        if (SYSTEM_BUS.get_sio_mode() == SioCom::sio_mode::NETSIO && fnSystem.millis() - poll_ts > 1000)
-        {
-            SYSTEM_BUS.poll(1);
-            poll_ts = fnSystem.millis();
-        }
-#endif
         readCount = fnio::fread(dataBuf, 1, 532, sourceFile);
         readTotal += readCount;
         // Check if we got enough bytes on the read
@@ -1075,11 +1068,11 @@ void sioFuji::image_rotate()
         count--;
 
         // Save the device ID of the disk in the last slot
-        int last_id = _fnDisks[count].disk_dev.id();
+        fujiDeviceID_t last_id = _fnDisks[count].disk_dev.id();
 
         for (int n = count; n > 0; n--)
         {
-            int swap = _fnDisks[n - 1].disk_dev.id();
+            fujiDeviceID_t swap = _fnDisks[n - 1].disk_dev.id();
             Debug_printf("setting slot %d to ID %x\n", n, swap);
             SYSTEM_BUS.changeDeviceId(&_fnDisks[n].disk_dev, swap);
         }
@@ -1513,8 +1506,8 @@ void sioFuji::sio_get_adapter_config_extended()
     strlcpy(cfg.sDnsIP,   fnSystem.Net.get_ip4_dns_str().c_str(),     16);
     strlcpy(cfg.sNetmask, fnSystem.Net.get_ip4_mask_str().c_str(),    16);
 
-    sprintf(cfg.sMacAddress, "%02X:%02X:%02X:%02X:%02X:%02X", cfg.macAddress[0], cfg.macAddress[1], cfg.macAddress[2], cfg.macAddress[3], cfg.macAddress[4], cfg.macAddress[5]);
-    sprintf(cfg.sBssid,      "%02X:%02X:%02X:%02X:%02X:%02X", cfg.bssid[0], cfg.bssid[1], cfg.bssid[2], cfg.bssid[3], cfg.bssid[4], cfg.bssid[5]);
+    snprintf(cfg.sMacAddress, sizeof(cfg.sMacAddress), "%02X:%02X:%02X:%02X:%02X:%02X", cfg.macAddress[0], cfg.macAddress[1], cfg.macAddress[2], cfg.macAddress[3], cfg.macAddress[4], cfg.macAddress[5]);
+    snprintf(cfg.sBssid, sizeof(cfg.sBssid), "%02X:%02X:%02X:%02X:%02X:%02X", cfg.bssid[0], cfg.bssid[1], cfg.bssid[2], cfg.bssid[3], cfg.bssid[4], cfg.bssid[5]);
 
     bus_to_computer((uint8_t *)&cfg, sizeof(cfg), false);
 
@@ -2058,12 +2051,19 @@ void sioFuji::insert_boot_device(uint8_t d)
         break;
     case 2:
         Debug_printf("Mounting lobby server\n");
-        if (fnTNFS.start("tnfs.fujinet.online"))
+        if (!fnTNFS.is_started())
         {
-            Debug_printf("opening lobby.\n");
-            fBoot = fnTNFS.fnfile_open("/ATARI/_lobby.xex");
-            _bootDisk.mount(fBoot, "/ATARI/_lobby.xex", 0);
+            Debug_printf("Starting TNFS connection\n");
+            if (!fnTNFS.start("tnfs.fujinet.online"))
+            {
+                Debug_printf("TNFS failed to start.\n");
+                return;
+            }
         }
+
+        Debug_printf("opening lobby.\n");
+        fBoot = fnTNFS.fnfile_open("/ATARI/_lobby.xex");
+        _bootDisk.mount(fBoot, "/ATARI/_lobby.xex", 0);
         break;
     }
 #else
@@ -2172,12 +2172,13 @@ void sioFuji::setup()
 
     // Add our devices to the SIO bus
     for (int i = 0; i < MAX_DISK_DEVICES; i++)
-        SYSTEM_BUS.addDevice(&_fnDisks[i].disk_dev, SIO_DEVICEID_DISK + i);
+        SYSTEM_BUS.addDevice(&_fnDisks[i].disk_dev, (fujiDeviceID_t) (FUJI_DEVICEID_DISK + i));
 
     for (int i = 0; i < MAX_NETWORK_DEVICES; i++)
-        SYSTEM_BUS.addDevice(sioNetDevs[i].get(), SIO_DEVICEID_FN_NETWORK + i);
+        SYSTEM_BUS.addDevice(sioNetDevs[i].get(),
+                             (fujiDeviceID_t) (FUJI_DEVICEID_NETWORK + i));
 
-    SYSTEM_BUS.addDevice(&_cassetteDev, SIO_DEVICEID_CASSETTE);
+    SYSTEM_BUS.addDevice(&_cassetteDev, FUJI_DEVICEID_CASSETTE);
     cassette()->set_buttons(Config.get_cassette_buttons());
     cassette()->set_pulldown(Config.get_cassette_pulldown());
 }

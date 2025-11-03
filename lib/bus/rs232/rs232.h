@@ -1,35 +1,18 @@
 #ifndef RS232_H
 #define RS232_H
 
-#include "fnUART.h"
+#include "UARTChannel.h"
+#include "fujiDeviceID.h"
+
+#ifdef ESP_PLATFORM
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#endif /* ESP_PLATFORM */
 
 #include <forward_list>
 
 #define RS232_BAUDRATE 9600
 //#define RS232_BAUDRATE 115200
-
-#define RS232_DEVICEID_DISK            0x31
-#define RS232_DEVICEID_DISK_LAST       0x3F
-
-#define RS232_DEVICEID_PRINTER         0x40
-#define RS232_DEVICEID_PRINTER_LAST    0x43
-
-#define RS232_DEVICEID_FN_VOICE        0x43
-
-#define RS232_DEVICEID_APETIME         0x45
-
-#define RS232_DEVICEID_RS232           0x50
-#define RS232_DEVICEID_RS2323_LAST     0x53
-
-#define RS232_DEVICEID_FUJINET         0x70
-#define RS232_DEVICEID_FN_NETWORK      0x71
-#define RS232_DEVICEID_FN_NETWORK_LAST 0x78
-
-#define RS232_DEVICEID_MIDI            0x99
-
-#define RS232_DEVICEID_CPM             0x5A
 
 #define DELAY_T4 800
 #define DELAY_T5 800
@@ -76,7 +59,7 @@ class virtualDevice
 protected:
     friend systemBus;
 
-    int _devnum;
+    fujiDeviceID_t _devnum;
 
     cmdFrame_t cmdFrame;
     bool listen_to_type3_polls = false;
@@ -158,7 +141,7 @@ public:
      * @brief get the RS232 device Number (1-255)
      * @return The device number registered for this device
      */
-    int id() { return _devnum; };
+    fujiDeviceID_t id() { return _devnum; };
 
     /**
      * @brief Command 0x3F '?' intended to return a single byte to the atari via bus_to_computer(), which
@@ -217,7 +200,11 @@ private:
 
     bool useUltraHigh = false; // Use fujinet derived clock.
 
-    UARTManager _port = UARTManager(FN_UART_BUS);
+#if FUJINET_OVER_USB
+    ACMChannel _port;
+#else /* ! FUJINET_OVER_USB */
+    UARTChannel _port;
+#endif /* FUJINET_OVER_USB */
 
     void _rs232_process_cmd();
     /* void _rs232_process_queue(); */
@@ -228,10 +215,10 @@ public:
     void shutdown();
 
     int numDevices();
-    void addDevice(virtualDevice *pDevice, int device_id);
+    void addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id);
     void remDevice(virtualDevice *pDevice);
-    virtualDevice *deviceById(int device_id);
-    void changeDeviceId(virtualDevice *pDevice, int device_id);
+    virtualDevice *deviceById(fujiDeviceID_t device_id);
+    void changeDeviceId(virtualDevice *pDevice, fujiDeviceID_t device_id);
 
     int getBaudrate();                                          // Gets current RS232 baud rate setting
     void setBaudrate(int baud);                                 // Sets RS232 to specific baud rate
@@ -249,19 +236,18 @@ public:
     rs232Printer *getPrinter() { return _printerdev; }
     rs232CPM *getCPM() { return _cpmDev; }
 
-    QueueHandle_t qRs232Messages = nullptr;
 
     bool shuttingDown = false;                                  // TRUE if we are in shutdown process
     bool getShuttingDown() { return shuttingDown; };
 
     // Everybody thinks "oh I know how a serial port works, I'll just
     // access it directly and bypass the bus!" ಠ_ಠ
-    size_t read(void *buffer, size_t length) { return _port.readBytes(buffer, length); }
+    size_t read(void *buffer, size_t length) { return _port.read(buffer, length); }
     size_t read() { return _port.read(); }
     size_t write(const void *buffer, size_t length) { return _port.write(buffer, length); }
     size_t write(int n) { return _port.write(n); }
     size_t available() { return _port.available(); }
-    void flush() { _port.flush(); }
+    void flushOutput() { _port.flushOutput(); }
     size_t print(int n, int base = 10) { return _port.print(n, base); }
     size_t print(const char *str) { return _port.print(str); }
     size_t print(const std::string &str) { return _port.print(str); }
