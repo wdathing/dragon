@@ -5,21 +5,11 @@
  */
 
 #include "network.h"
+#include "../network.h"
+#include "fuji_endian.h"
 
 #include <cstring>
 #include <algorithm>
-
-#ifdef __APPLE__
-#include <libkern/OSByteOrder.h>
-#define htobe16(x) OSSwapHostToBigInt16(x)
-#else
-#if defined(_WIN16) || defined(_WIN32) || defined(_WIN64) || defined(__WINDOWS__)
-#include <winsock2.h>
-#define htobe16(x) htons(x)
-#else
-#include <endian.h>
-#endif // windows
-#endif /* __APPLE__ */
 
 #include "../../include/debug.h"
 #include "../../include/pinmap.h"
@@ -28,15 +18,7 @@
 #include "utils.h"
 
 #include "status_error_codes.h"
-#include "TCP.h"
-#include "UDP.h"
-#include "Test.h"
-#include "Telnet.h"
-#include "TNFS.h"
-#include "FTP.h"
-#include "HTTP.h"
-#include "SSH.h"
-#include "SMB.h"
+#include "Protocol.h"
 
 using namespace std;
 
@@ -139,7 +121,7 @@ void drivewireNetwork::ready()
  */
 void drivewireNetwork::open()
 {
-    Debug_printf("drivewireNetwork::sio_open(%02x,%02x)\n",cmdFrame.aux1,cmdFrame.aux2);
+    Debug_printf("drivewireNetwork::open(%02x,%02x)\n",cmdFrame.aux1,cmdFrame.aux2);
 
     char tmp[256];
 
@@ -155,7 +137,7 @@ void drivewireNetwork::open()
     }
 
     deviceSpec = std::string(tmp);
-    
+
     channelMode = PROTOCOL;
 
     // Delete timer if already extant.
@@ -242,7 +224,7 @@ void drivewireNetwork::open()
  */
 void drivewireNetwork::close()
 {
-    Debug_printf("drivewireNetwork::sio_close()\n");
+    Debug_printf("drivewireNetwork::close()\n");
 
     ns.reset();
 
@@ -278,7 +260,7 @@ void drivewireNetwork::close()
 #ifdef ESP_PLATFORM
     Debug_printv("After protocol delete %lu\n",esp_get_free_internal_heap_size());
 #endif
-    
+
     //SYSTEM_BUS.write(ns.error);
 }
 
@@ -328,7 +310,7 @@ void drivewireNetwork::read()
 
     // And set response buffer.
     response += *receiveBuffer;
- 
+
     // Remove from receive buffer and shrink.
     receiveBuffer->erase(0, num_bytes);
     receiveBuffer->shrink_to_fit();
@@ -400,7 +382,7 @@ void drivewireNetwork::write()
         return;
     }
 
-    Debug_printf("sioNetwork::drivewire_write( %u bytes)\n", num_bytes);
+    Debug_printf("drivewireNetwork::drivewire_write( %u bytes)\n", num_bytes);
 
     // If protocol isn't connected, then return not connected.
     if (protocol == nullptr)
@@ -509,7 +491,6 @@ bool drivewireNetwork::status_channel_json(NetworkStatus *ns)
 {
     ns->connected = json_bytes_remaining > 0;
     ns->error = json_bytes_remaining > 0 ? 1 : 136;
-    ns->rxBytesWaiting = json_bytes_remaining;
     return false; // for now
 }
 
@@ -519,6 +500,7 @@ bool drivewireNetwork::status_channel_json(NetworkStatus *ns)
 void drivewireNetwork::status_channel()
 {
     NDeviceStatus status;
+    size_t avail = 0;
 
     Debug_printf("drivewireNetwork::sio_status_channel(%u)\n", channelMode);
 
@@ -530,17 +512,17 @@ void drivewireNetwork::status_channel()
             ns.error = true;
         } else {
             protocol->status(&ns);
+            avail = protocol->available();
         }
         break;
     case JSON:
         status_channel_json(&ns);
+        avail = json_bytes_remaining;
         break;
     }
     // clear forced flag (first status after open)
     protocol->forceStatus = false;
 
-    // Serialize status into status bytes (rxBytesWaiting sent big endian!)
-    size_t avail = ns.rxBytesWaiting;
     avail = avail > 65535 ? 65535 : avail;
     status.avail = htobe16(avail);
     status.conn = ns.connected;
@@ -587,14 +569,14 @@ void drivewireNetwork::set_prefix()
 
     prefixSpec_str = string((const char *)tmp);
     prefixSpec_str = prefixSpec_str.substr(prefixSpec_str.find_first_of(":") + 1);
-    Debug_printf("sioNetwork::sio_set_prefix(%s)\n", prefixSpec_str.c_str());
+    Debug_printf("drivewireNetwork::set_prefix(%s)\n", prefixSpec_str.c_str());
 
     // If "NCD Nn:" then prefix is cleared completely
     if (prefixSpec_str.empty())
     {
         prefix.clear();
     }
-    else 
+    else
     {
         // For the remaining cases, append trailing slash if not found
         if (prefix[prefix.size()-1] != '/')
@@ -682,8 +664,8 @@ void drivewireNetwork::set_login()
         return;
     }
 
-    login = std::string(tmp,256);    
-    
+    login = std::string(tmp,256);
+
     Debug_printf("drivewireNetwork::set_login(%s)\n",login.c_str());
 }
 
@@ -716,7 +698,7 @@ void drivewireNetwork::set_password()
  */
 void drivewireNetwork::special()
 {
-    do_inquiry(cmdFrame.comnd);
+    do_inquiry((fujiCommandID_t) cmdFrame.comnd);
 
     switch (inq_dstats)
     {
@@ -744,13 +726,13 @@ void drivewireNetwork::special_inquiry()
 {
     Debug_printf("drivewireNetwork::special_inquiry(%02x)\n", cmdFrame.aux1);
 
-    do_inquiry(cmdFrame.aux1);
+    do_inquiry((fujiCommandID_t) cmdFrame.aux1);
 
     // Finally, return the completed inq_dstats value back to CoCo
     SYSTEM_BUS.write(&inq_dstats, sizeof(inq_dstats));
 }
 
-void drivewireNetwork::do_inquiry(unsigned char inq_cmd)
+void drivewireNetwork::do_inquiry(fujiCommandID_t inq_cmd)
 {
     // Reset inq_dstats
     inq_dstats = 0xff;
@@ -921,56 +903,12 @@ void drivewireNetwork::special_80()
  */
 bool drivewireNetwork::instantiate_protocol()
 {
-    if (urlParser == nullptr)
+    if (!protocolParser)
     {
-        Debug_printf("drivewireNetwork::open_protocol() - urlParser is NULL. Aborting.\n");
-        return false; // error.
+        protocolParser = new ProtocolParser();
     }
 
-    // Convert to uppercase
-    transform(urlParser->scheme.begin(), urlParser->scheme.end(), urlParser->scheme.begin(), ::toupper);
-
-    if (urlParser->scheme == "TCP")
-    {
-        protocol = new NetworkProtocolTCP(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "UDP")
-    {
-        protocol = new NetworkProtocolUDP(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "TEST")
-    {
-        protocol = new NetworkProtocolTest(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "TELNET")
-    {
-        protocol = new NetworkProtocolTELNET(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "TNFS")
-    {
-        protocol = new NetworkProtocolTNFS(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "FTP")
-    {
-        protocol = new NetworkProtocolFTP(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "HTTP" || urlParser->scheme == "HTTPS")
-    {
-        protocol = new NetworkProtocolHTTP(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "SSH")
-    {
-        protocol = new NetworkProtocolSSH(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else if (urlParser->scheme == "SMB")
-    {
-        protocol = new NetworkProtocolSMB(receiveBuffer, transmitBuffer, specialBuffer);
-    }
-    else
-    {
-        Debug_printf("Invalid protocol: %s\n", urlParser->scheme.c_str());
-        return false; // invalid protocol.
-    }
+    protocol = protocolParser->createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
 
     if (protocol == nullptr)
     {
@@ -1030,7 +968,7 @@ void drivewireNetwork::poll_interrupt()
         protocol->status(&ns);
         protocol->fromInterrupt = false;
 
-        if (ns.rxBytesWaiting > 0 || ns.connected == 0)
+        if (protocol->available() > 0 || ns.connected == 0)
             assert_interrupt();
 #ifndef ESP_PLATFORM
 else
@@ -1112,7 +1050,7 @@ void drivewireNetwork::parse_and_instantiate_protocol()
         Debug_printf("Could not open protocol. spec: >%s<, url: >%s<\n", deviceSpec.c_str(), urlParser->mRawUrl.c_str());
         ns.error = NETWORK_ERROR_GENERAL;
         return;
-    }  
+    }
 }
 
 /**
@@ -1257,7 +1195,7 @@ void drivewireNetwork::json_query()
 
     // Query param is only used in ATARI at the moment, and 256 is too large for the type.
     json->setReadQuery(in_string, 0);
-    json_bytes_remaining = json->json_bytes_remaining;
+    json_bytes_remaining = json->available();
 
     std::vector<uint8_t> tmp(json_bytes_remaining);
     json->readValue(tmp.data(), json_bytes_remaining);
@@ -1268,7 +1206,7 @@ void drivewireNetwork::json_query()
 
     for (int i=0;i<in_string.length();i++)
         Debug_printf("%02X ",(unsigned char)in_string[i]);
-    
+
     Debug_printf("\n");
 
     Debug_printf("Query set to >%s<\r\n", in_string.c_str());
@@ -1307,7 +1245,7 @@ void drivewireNetwork::process()
     cmdFrame.aux2 = (uint8_t)SYSTEM_BUS.read();
 
     Debug_printf("comnd: '%c' %u,%u,%u\n",cmdFrame.comnd,cmdFrame.comnd,cmdFrame.aux1,cmdFrame.aux2);
-    
+
     switch (cmdFrame.comnd)
     {
     case 0x00: // Ready?

@@ -7,6 +7,10 @@
 
 #include "../../include/debug.h"
 
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#define unsetenv(name) _putenv_s(name, "")
+#endif /* _WIN32 */
 
 #define RS232_APETIMECMD_GETTIME 0x93
 #define RS232_APETIMECMD_SETTZ 0x99
@@ -79,7 +83,7 @@ void rs232ApeTime::_rs232_set_tz()
 
         rs232_complete();
 
-        Debug_printf("TZ set to <%s>\n", ape_timezone); 
+        Debug_printf("TZ set to <%s>\n", ape_timezone);
       }
     } else {
       Debug_printf("TZ unset\n");

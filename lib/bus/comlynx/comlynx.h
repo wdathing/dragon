@@ -5,6 +5,8 @@
  * Comlynx Routines
  */
 
+#include "UARTChannel.h"
+#include "fujiDeviceID.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -29,13 +31,6 @@
 #define NM_CANCEL 0x0A // response.control (cancel)
 #define NM_SEND 0x0B   // response.data (send)
 #define NM_NACK 0x0C   // response.control (nack)
-
-#define COMLYNX_DEVICE_ID_KEYBOARD 0x01
-#define COMLYNX_DEVICE_ID_PRINTER  0x02
-#define COMLYNX_DEVICEID_DISK      0x04
-#define COMLYNX_DEVICE_TAPE        0x08
-#define COMLYNX_DEVICE_NETWORK     0x0E
-#define COMLYNX_DEVICE_FUJINET     0x0F
 
 #define COMLYNX_RESET_DEBOUNCE_PERIOD 100 // in ms
 
@@ -160,7 +155,7 @@ protected:
     /**
      * @brief Device Number: 0-15
      */
-    uint8_t _devnum;
+    fujiDeviceID_t _devnum;
 
     virtual void shutdown() {}
 
@@ -232,7 +227,7 @@ public:
      * @brief return the device number (0-15) of this device
      * @return the device # (0-15) of this device
      */
-    uint8_t id() { return _devnum; }
+    fujiDeviceID_t id() { return _devnum; }
 
 
 };
@@ -248,6 +243,7 @@ private:
     lynxFuji *_fujiDev = nullptr;
     lynxPrinter *_printerDev = nullptr;
 
+    UARTChannel _port;
 
     void _comlynx_process_cmd();
     void _comlynx_process_queue();
@@ -272,15 +268,15 @@ public:
     //int64_t comlynx_idle_time = 1000;
 
     int numDevices();
-    void addDevice(virtualDevice *pDevice, FujiDeviceID device_id);
+    void addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id);
     void remDevice(virtualDevice *pDevice);
-    void remDevice(FujiDeviceID device_id);
-    bool deviceExists(FujiDeviceID device_id);
-    void enableDevice(FujiDeviceID device_id);
-    void disableDevice(FujiDeviceID device_id);
-    virtualDevice *deviceById(FujiDeviceID device_id);
-    void changeDeviceId(virtualDevice *pDevice, FujiDeviceID device_id);
-    bool deviceEnabled(FujiDeviceID device_id);
+    void remDevice(fujiDeviceID_t device_id);
+    bool deviceExists(fujiDeviceID_t device_id);
+    void enableDevice(fujiDeviceID_t device_id);
+    void disableDevice(fujiDeviceID_t device_id);
+    virtualDevice *deviceById(fujiDeviceID_t device_id);
+    void changeDeviceId(virtualDevice *pDevice, fujiDeviceID_t device_id);
+    bool deviceEnabled(fujiDeviceID_t device_id);
     QueueHandle_t qComlynxMessages = nullptr;
     void setUDPHost(const char *newhost, int port);             // Set new host/ip & port for UDP Stream
 
@@ -289,9 +285,20 @@ public:
 
     bool shuttingDown = false;                                  // TRUE if we are in shutdown process
     bool getShuttingDown() { return shuttingDown; };
+
+    // Everybody thinks "oh I know how a serial port works, I'll just
+    // access it directly and bypass the bus!" ಠ_ಠ
+    size_t read(void *buffer, size_t length) { return _port.read(buffer, length); }
+    size_t read() { return _port.read(); }
+    size_t write(const void *buffer, size_t length) { return _port.write(buffer, length); }
+    size_t write(int n) { return _port.write(n); }
+    size_t available() { return _port.available(); }
+    void flush() { _port.flushOutput(); }
+    size_t print(int n, int base = 10) { return _port.print(n, base); }
+    size_t print(const char *str) { return _port.print(str); }
+    size_t print(const std::string &str) { return _port.print(str); }
 };
 
 extern systemBus SYSTEM_BUS;
-//extern systemBus ComLynx;
 
 #endif /* COMLYNX_H */
