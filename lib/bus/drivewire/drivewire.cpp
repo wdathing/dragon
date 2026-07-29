@@ -181,7 +181,7 @@ void systemBus::op_readex()
         if (true == bDragon && drive_num >= 5)
             drive_num = drive_num - 5;
 
-        Debug_printf("OP_READ: DRIVE %3u - SECTOR %8lu\n", drive_num, lsn);
+        Debug_printf("OP_READ: DRIVE %3u - SECTOR %8lu, bDragon %d\n", drive_num, lsn, bDragon);
 
         if (theFuji->boot_config && drive_num == 0)
             d = &theFuji->bootdisk;
@@ -545,7 +545,7 @@ void systemBus::_drivewire_process_cmd()
         Debug_println("Failed to read cmd!");
         return;
     }
-
+    Debug_printf("_drivewire_process_cmd: cmd 0x%02x\r\n", c);
     fnLedManager.set(eLed::LED_BUS, true);
 
     if (c >= 0x80 && c <= 0x8F) {
@@ -748,6 +748,7 @@ void systemBus::configureGPIO()
 
 int systemBus::readBaudSwitch()
 {
+#ifndef CENTIPEDE_BOARD
     if (fnSystem.digital_read(PIN_EPROM_A14) == DIGI_LOW
         && fnSystem.digital_read(PIN_EPROM_A15) == DIGI_LOW)
     {
@@ -771,6 +772,14 @@ int systemBus::readBaudSwitch()
 
     Debug_printv("A14 and A15 High, defaulting to 57600 baud");
     return 57600; //Default or no switch
+#else
+    int baud = 115200 * 1; // Centipede build defaults to 460800 baud and doesn't use the A14/A15
+                       // switches
+    Debug_printv("Centipede build, defaulting to %d baud", baud);
+    bDragon = false;
+    return baud; // Centipede build defaults to 460800 baud and doesn't use the A14/A15
+                 // switches
+#endif
 }
 #endif /* ESP_PLATFORM */
 
@@ -781,6 +790,7 @@ void systemBus::setup()
     // Create a queue to handle parallel event from ISR
     drivewire_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     bDragon = false;
+    szNamedMount[0] = (uint8_t)0;
 
 #ifdef CONFIG_IDF_TARGET_ESP32S3
     // Configure UART to RP2040
@@ -818,7 +828,13 @@ void systemBus::setup()
                       .deviceID(DW_UART_DEVICE)
                       .readTimeout(500)
 #ifdef ESP_PLATFORM
+#ifndef CENTIPEDE_BOARD
                       .inverted(DW_UART_DEVICE == UART_NUM_2)
+#else
+                      .flowControl(UART_HW_FLOWCTRL_CTS_RTS)
+                      .rtsPin(PIN_UART1_RTS)
+                      .ctsPin(PIN_UART1_CTS)
+#endif /* CENTIPEDE_BOARD */
 #endif /* ESP_PLATFORM */
                       );
         _port = &_serial;
@@ -839,7 +855,6 @@ void systemBus::setup()
     //     }
     // }
     // end jeff hack
-
 }
 
 // Give devices an opportunity to clean up before a reboot

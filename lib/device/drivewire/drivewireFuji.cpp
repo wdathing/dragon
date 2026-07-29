@@ -443,6 +443,7 @@ void drivewireFuji::ready()
 void drivewireFuji::process()
 {
     uint8_t c = SYSTEM_BUS.read();
+    Debug_printf("process: cmd 0x%02x\r\n", c);
 
     _errorCode = 1;
     switch (c)
