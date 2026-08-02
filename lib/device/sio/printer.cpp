@@ -77,7 +77,7 @@ void sioPrinter::sio_write(uint8_t aux1, uint8_t aux2)
     }
 
     memset(_buffer, 0, sizeof(_buffer)); // clear _buffer
-    if (transaction_get(_buffer, linelen))
+    if (SYSTEM_BUS.transaction_get(_buffer, linelen))
     {
         if (linelen == 29)
         {
@@ -95,15 +95,15 @@ void sioPrinter::sio_write(uint8_t aux1, uint8_t aux2)
         memcpy(_pptr->provideBuffer(), _buffer, linelen);
 
         if (_pptr->process(linelen, aux1, aux2))
-            transaction_complete();
+            SYSTEM_BUS.transaction_success();
         else
         {
-            transaction_error();
+            SYSTEM_BUS.transaction_error();
         }
     }
     else
     {
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
     }
 }
 
@@ -118,7 +118,7 @@ void sioPrinter::print_from_cpm(uint8_t c)
 }
 
 // Status
-void sioPrinter::sio_status()
+void sioPrinter::sio_status(const FujiSIOPacket &packet)
 {
     /*
   STATUS frame per the 400/800 OS ROM Manual
@@ -153,7 +153,7 @@ void sioPrinter::sio_status()
     status[2] = 5;
     status[3] = 0;
 
-    transaction_put(status, sizeof(status), false);
+    SYSTEM_BUS.transaction_send(status, sizeof(status), false);
 }
 
 void sioPrinter::set_printer_type(sioPrinter::printer_type printer_type)
@@ -275,34 +275,31 @@ sioPrinter::printer_type sioPrinter::match_modelname(std::string model_name)
 }
 
 // Process command
-void sioPrinter::sio_process(uint32_t commanddata, uint8_t checksum)
+void sioPrinter::sio_process(const FujiSIOPacket &packet)
 {
-    cmdFrame.commanddata = commanddata;
-    cmdFrame.checksum = checksum;
-
     if (!Config.get_printer_enabled())
     {
         Debug_println("sioPrinter::disabled, ignoring");
     }
     else
     {
-        switch (cmdFrame.comnd)
+        switch (packet.command())
         {
         case SIO_PRINTERCMD_PUT: // Needed by A822 for graphics mode printing
         case SIO_PRINTERCMD_WRITE:
-            _lastaux1 = cmdFrame.aux1;
-            _lastaux2 = cmdFrame.aux2;
+            _lastaux1 = packet.param(0);
+            _lastaux2 = packet.param(1);
             _last_ms = fnSystem.millis();
-            transaction_begin(TRANS_STATE::WILL_GET);
+            SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
             sio_write(_lastaux1, _lastaux2);
             break;
         case SIO_PRINTERCMD_STATUS:
             _last_ms = fnSystem.millis();
-            transaction_begin(TRANS_STATE::NO_GET);
-            sio_status();
+            SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+            sio_status(packet);
             break;
         default:
-            transaction_error();
+            SYSTEM_BUS.transaction_error();
         }
     }
 }

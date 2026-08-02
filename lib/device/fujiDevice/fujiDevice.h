@@ -4,6 +4,7 @@
 #include "fnConfig.h"
 #include "Base64Mixin.h"
 #include "HashMixin.h"
+#include "QRMixin.h"
 
 #include "../fuji/fujiHost.h"
 #include "../fuji/fujiDisk.h"
@@ -12,14 +13,6 @@
 #include <optional>
 #include <map>
 #include <atomic>
-
-#if defined(BUILD_ATARI) || defined(BUILD_LYNX)
-#define SYSTEM_BUS_IS_UDP 1
-#endif /* BUILD_ATARI || BUILD_LYNX */
-
-#ifdef BUILD_ATARI
-#define SYSTEM_BUS_IS_SERIAL 1
-#endif /* BUILD_ATARI */
 
 #define MAX_HOSTS MAX_HOST_SLOTS
 #define MAX_DISK_DEVICES MAX_MOUNT_SLOTS
@@ -136,6 +129,9 @@ concept FujiPacketLike = requires(T p) {
     { p.dataAsString() };
 };
 
+static_assert(FujiPacketLike<FUJI_COMMAND_PACKET>,
+              "FUJI_COMMAND_PACKET must satisfy FujiPacketLike");
+
 // This class inherits from all the mixins you list and tries each one in order
 template<typename... FujiDeviceMixins>
 requires FujiPacketLike<FUJI_COMMAND_PACKET>
@@ -145,6 +141,10 @@ class FujiDeviceChain : public FujiDeviceMixins...
     bool tryAllMixins(const FUJI_COMMAND_PACKET &packet) {
         // Try each mixin's processCommand() until one returns true
         return (FujiDeviceMixins::processCommand(packet) || ...);
+    }
+    bool checkAllMixins(const FUJI_COMMAND_PACKET &packet) {
+        // Try each mixin's processCommand() until one returns true
+        return (FujiDeviceMixins::recognizesCommand(packet) || ...);
     }
 
  public:
@@ -156,7 +156,7 @@ class FujiDeviceChain : public FujiDeviceMixins...
 
 class fujiDevice : public virtual virtualDevice, public VDevMigrationWrapper
 #ifdef FUJI_MIXINS_ENABLED
-                 , public FujiDeviceChain<Base64Mixin, HashMixin>
+                 , public FujiDeviceChain<Base64Mixin, HashMixin, QRMixin>
 #endif // FUJI_MIXINS_ENABLED
 {
 private:
@@ -207,7 +207,11 @@ public:
 
 #ifdef FUJI_MIXINS_ENABLED
     // Return true if command was handled here
-    bool processCommand(const FUJI_COMMAND_PACKET &packet) override {
+    bool processCommand(const FUJI_COMMAND_PACKET &packet) {
+        return tryAllMixins(packet);
+    }
+    // Return true if command is one that can be handled
+    bool recognizesCommand(const FUJI_COMMAND_PACKET &packet) {
         return tryAllMixins(packet);
     }
 #endif // FUJI_MIXINS_ENABLED
@@ -262,10 +266,6 @@ public:
     void fujicmd_read_device_slots();
     void fujicmd_write_device_slots();
     void fujicmd_status();
-    void fujicmd_set_sio_external_clock(uint16_t speed);
-#ifdef SYSTEM_BUS_IS_UDP
-    void fujicmd_enable_netstream(int port);
-#endif /* SYSTEM_BUS_IS_UDP */
 
     // Move appkey stuff to its own file?
     virtual void fujicmd_open_app_key();

@@ -2595,20 +2595,20 @@ void sioPCLink::send_ack_byte(uint8_t  what)
         {
         case 'a':
 #ifndef ESP_PLATFORM
-        transaction_begin(TRANS_STATE::WILL_GET);
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
         break;
 #endif
     case 'A':
-        transaction_begin(TRANS_STATE::NO_GET);
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         break;
     case 'N':
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         break;
     case 'C':
-        transaction_complete();
+        SYSTEM_BUS.transaction_success();
         break;
     case 'E':
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         break;
         }
 }
@@ -2651,22 +2651,19 @@ void sioPCLink::unmount(int no)
 }
 
 // Status
-void sioPCLink::sio_status()
+void sioPCLink::sio_status(const FujiSIOPacket &packet)
 {
 // # ifdef SIOTRACE
 //      if (log_flag)
                 Debug_printf("STATUS: %02x %02x %02x %02x\n", status[0], status[1], status[2], status[3]);
 // # endif
-    transaction_put(status, sizeof(status), false);
+    SYSTEM_BUS.transaction_send(status, sizeof(status), false);
 }
 
 // Process SIO command
-void sioPCLink::sio_process(uint32_t commanddata, uint8_t checksum)
+void sioPCLink::sio_process(const FujiSIOPacket &packet)
 {
-    cmdFrame.commanddata = commanddata;
-    cmdFrame.checksum = checksum;
-
-    uchar cunit = cmdFrame.aux2 & 0x0f; /* PCLink ignores DUNIT */
+    uchar cunit = packet.param8(1) & 0x0f; /* PCLink ignores DUNIT */
     uchar cdev = FUJI_DEVICEID_PCLINK;
     uchar devno = cdev >> 4; // ??? magical 6
 
@@ -2681,21 +2678,21 @@ void sioPCLink::sio_process(uint32_t commanddata, uint8_t checksum)
     /* cunit == 0 is init during warm reset */
     if ((cunit == 0) || device[cunit].on)
     {
-        switch (cmdFrame.comnd)
+        switch (packet.command())
         {
         case 'P':
             Debug_println("PARBLK");
-            do_pclink(devno, cmdFrame.comnd, cmdFrame.aux1, cmdFrame.aux2);
+            do_pclink(devno, packet.command(), packet.param(0), packet.param(1));
             break;
         case 'R':
             Debug_println("EXEC");
-            do_pclink(devno, cmdFrame.comnd, cmdFrame.aux1, cmdFrame.aux2);
+            do_pclink(devno, packet.command(), packet.param(0), packet.param(1));
             break;
         case 'S':       /* status */
             Debug_println("STATUS");
             pclink_ack(devno, cunit, 'A');
             get_device_status(devno, cunit, status);
-            sio_status();
+            sio_status(packet);
             break;
         case '?':       /* send hi-speed index */
             Debug_println("HIGH SPEED INDEX");

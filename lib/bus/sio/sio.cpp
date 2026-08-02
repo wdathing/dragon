@@ -23,12 +23,6 @@
 
 // Helper functions outside the class defintions
 
-// Get requested buffer length from command frame
-unsigned short virtualDevice::sio_get_aux()
-{
-    return (cmdFrame.aux2 * 256) + cmdFrame.aux1;
-}
-
 // Calculate 8-bit checksum
 uint8_t sio_checksum(uint8_t *buf, unsigned short len)
 {
@@ -40,90 +34,8 @@ uint8_t sio_checksum(uint8_t *buf, unsigned short len)
     return chk;
 }
 
-/*
-   SIO WRITE to ATARI from DEVICE
-   buf = buffer to send to Atari
-   len = length of buffer
-   err = along with data, send ERROR status to Atari rather than COMPLETE
-*/
-void virtualDevice::_bus_to_computer(uint8_t *buf, uint16_t len, bool err)
-{
-    // Write data frame to computer
-    Debug_printf("->SIO write %hu bytes\n", len);
-#ifdef VERBOSE_SIO
-    Debug_printf("SEND <%u> BYTES\n\t", len);
-    for (int i = 0; i < len; i++)
-        Debug_printf("%02x ", buf[i]);
-    Debug_print("\n");
-#endif
-
-    // Write ERROR or COMPLETE status
-    if (err == true)
-        _sio_error();
-    else
-        _sio_complete();
-
-    // Write data frame
-    SYSTEM_BUS.write(buf, len);
-    // Write checksum
-    SYSTEM_BUS.write(sio_checksum(buf, len));
-
-    SYSTEM_BUS.flushOutput();
-}
-
-// TODO apc: change return type to indicate valid/invalid checksum
-/*
-   SIO READ from ATARI by DEVICE
-   buf = buffer from atari to fujinet
-   len = length
-   Returns checksum
-*/
-uint8_t virtualDevice::_bus_to_peripheral(uint8_t *buf, unsigned short len)
-{
-    // Retrieve data frame from computer
-    Debug_printf("<-SIO read %hu bytes\n", len);
-
-#ifndef ESP_PLATFORM
-    if (SYSTEM_BUS.isBoIP())
-    {
-        SYSTEM_BUS.netsio_write_size(len); // set hint for NetSIO
-    }
-#endif /* ! ESP_PLATFORM */
-
-    __BEGIN_IGNORE_UNUSEDVARS
-    size_t l = SYSTEM_BUS.read(buf, len);
-    __END_IGNORE_UNUSEDVARS
-
-    // Wait for checksum
-    while (SYSTEM_BUS.available() <= 0)
-        fnSystem.yield();
-    uint8_t ck_rcv = SYSTEM_BUS.read();
-
-    uint8_t ck_tst = sio_checksum(buf, len);
-
-#ifdef VERBOSE_SIO
-    Debug_printf("RECV <%u> BYTES, checksum: %hu\n\t", (unsigned int)l, ck_rcv);
-    for (int i = 0; i < len; i++)
-        Debug_printf("%02x ", buf[i]);
-    Debug_print("\n");
-#endif
-
-    fnSystem.delay_microseconds(DELAY_T4);
-
-    if (ck_rcv != ck_tst)
-    {
-        _sio_error();
-        Debug_printf("bus_to_peripheral() - Data Frame Chksum error, calc %02x, rcv %02x\n", ck_tst, ck_rcv);
-        // return false; // apc
-    }
-    else
-        _sio_ack();
-
-    return ck_rcv; // TODO apc: change to true and update all callers, no need to calculate/check checksum again
-}
-
 // SIO NAK
-void virtualDevice::_sio_nak()
+void systemBus::_sio_nak()
 {
     SYSTEM_BUS.write('N');
     SYSTEM_BUS.flushOutput();
@@ -134,7 +46,7 @@ void virtualDevice::_sio_nak()
 }
 
 // SIO ACK
-void virtualDevice::_sio_ack()
+void systemBus::_sio_ack()
 {
     SYSTEM_BUS.write('A');
     fnSystem.delay_microseconds(DELAY_T5); //?
@@ -147,7 +59,7 @@ void virtualDevice::_sio_ack()
 
 // SIO ACK, delayed for NetSIO sync
 #ifndef ESP_PLATFORM
-void virtualDevice::_sio_late_ack()
+void systemBus::_sio_late_ack()
 {
     if (SYSTEM_BUS.isBoIP())
     {
@@ -163,7 +75,7 @@ void virtualDevice::_sio_late_ack()
 #endif
 
 // SIO COMPLETE
-void virtualDevice::_sio_complete()
+void systemBus::_sio_complete()
 {
     fnSystem.delay_microseconds(DELAY_T5);
     SYSTEM_BUS.write('C');
@@ -171,21 +83,107 @@ void virtualDevice::_sio_complete()
 }
 
 // SIO ERROR
-void virtualDevice::_sio_error()
+void systemBus::_sio_error()
 {
     fnSystem.delay_microseconds(DELAY_T5);
     SYSTEM_BUS.write('E');
     Debug_println("ERROR!");
 }
 
+/*
+   SIO WRITE to ATARI from DEVICE
+   buf = buffer to send to Atari
+   len = length of buffer
+   err = along with data, send ERROR status to Atari rather than COMPLETE
+*/
+void systemBus::transaction_send(const void *data, size_t len, bool is_error)
+{
+    assert(_transaction_state == TRANS_STATE::NO_GET);
+
+    // Write data frame to computer
+    Debug_printf("->SIO write %hu bytes\n", len);
+#ifdef VERBOSE_SIO
+    Debug_printf("SEND <%u> BYTES\n\t", len);
+    for (int i = 0; i < len; i++)
+        Debug_printf("%02x ", buf[i]);
+    Debug_print("\n");
+#endif
+
+    // Write ERROR or COMPLETE status
+    if (is_error == true)
+        _sio_error();
+    else
+        _sio_complete();
+
+    // Write data frame
+    SYSTEM_BUS.write(data, len);
+    // Write checksum
+    SYSTEM_BUS.write(sio_checksum((uint8_t *) data, len));
+
+    SYSTEM_BUS.flushOutput();
+
+    _transaction_state = TRANS_STATE::INVALID;
+}
+
+// TODO apc: change return type to indicate valid/invalid checksum
+/*
+   SIO READ from ATARI by DEVICE
+   data = buffer from atari to fujinet
+   len = length
+   Returns TRUE on success, FALSE on error
+*/
+success_is_true systemBus::transaction_get(void *data, size_t len)
+{
+    // Retrieve data frame from computer
+    Debug_printf("<-SIO read %hu bytes\n", len);
+
+    assert(_transaction_state == TRANS_STATE::WILL_GET);
+    _transaction_state = TRANS_STATE::DID_GET;
+
+    if (_activeFrame->setDataLength(len).is_error())
+        RETURN_ERROR_AS_FALSE();
+    std::copy(_activeFrame->data()->begin(), _activeFrame->data()->end(),
+              static_cast<uint8_t *>(data));
+    RETURN_SUCCESS_AS_TRUE();
+}
+
+void systemBus::transaction_accept(transState_t expectMoreData)
+{
+    assert(_transaction_state == TRANS_STATE::INVALID);
+    _transaction_state = expectMoreData;
+    // For some reason NetSIO needs a hint that this is a WRITE transaction
+    if (expectMoreData == TRANS_STATE::WILL_GET)
+        _sio_late_ack();
+    else
+        _sio_ack();
+}
+
+void systemBus::transaction_success()
+{
+    assert(_transaction_state == TRANS_STATE::NO_GET || _transaction_state == TRANS_STATE::DID_GET);
+    _sio_complete();
+    _transaction_state = TRANS_STATE::INVALID;
+}
+
+void systemBus::transaction_error()
+{
+    // Not yet ACKed -> the command itself was invalid: NAK.  Already
+    // ACKed -> failure during/after processing: ERROR ('E' -> 144).
+    if (_transaction_state == TRANS_STATE::INVALID)
+        _sio_nak();
+    else
+        _sio_error();
+    _transaction_state = TRANS_STATE::INVALID;
+}
+
 // SIO HIGH SPEED REQUEST
 void virtualDevice::sio_high_speed()
 {
-    transaction_begin(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     int index = SYSTEM_BUS.getHighSpeedIndex();
     uint8_t hsd = index == HSIO_INVALID_INDEX ? 40 : (uint8_t)index;
     Debug_printf("sio HSIO INDEX: %d\n", hsd);
-    transaction_put((uint8_t *)&hsd, 1, false);
+    SYSTEM_BUS.transaction_send(hsd);
 }
 
 // Read and process a command frame from SIO
@@ -207,11 +205,9 @@ void systemBus::_sio_process_cmd()
     }
 
     // Read CMD frame
-    cmdFrame_t tempFrame;
-    tempFrame.commanddata = 0;
-    tempFrame.checksum = 0;
+    FujiSIOPacket tmpFrame;
 
-    if (_port->read((uint8_t *)&tempFrame, sizeof(tempFrame)) != sizeof(tempFrame))
+    if (_port->read((uint8_t *)&tmpFrame.frame, sizeof(tmpFrame.frame)) != sizeof(tmpFrame.frame))
     {
         // Debug_println("Timeout waiting for data after CMD pin asserted");
         return;
@@ -221,7 +217,8 @@ void systemBus::_sio_process_cmd()
 
     Debug_print("\n");
     Debug_printf("CF: %02x %02x %02x %02x %02x\n",
-                 tempFrame.device, tempFrame.comnd, tempFrame.aux1, tempFrame.aux2, tempFrame.checksum);
+                 tmpFrame.device(), tmpFrame.command(),
+                 tmpFrame.frame.aux1, tmpFrame.frame.aux2, tmpFrame.frame.checksum);
 
     // Wait for CMD line to raise again
 #ifdef ESP_PLATFORM
@@ -248,14 +245,15 @@ void systemBus::_sio_process_cmd()
     }
 #endif
 
-    uint8_t ck = sio_checksum((uint8_t *)&tempFrame.commanddata, sizeof(tempFrame.commanddata)); // Calculate Checksum
-    if (ck == tempFrame.checksum)
+    uint8_t ck = sio_checksum((uint8_t *)&tmpFrame.frame.commanddata, sizeof(tmpFrame.frame.commanddata)); // Calculate Checksum
+    if (ck == tmpFrame.frame.checksum)
     {
+        _activeFrame = &tmpFrame;
 #ifndef ESP_PLATFORM
         // reset counter if checksum was correct
         _command_frame_counter = 0;
 #endif
-        if (tempFrame.device == FUJI_DEVICEID_DISK && _fujiDev != nullptr && _fujiDev->boot_config)
+        if (tmpFrame.device() == FUJI_DEVICEID_DISK && _fujiDev != nullptr && _fujiDev->boot_config)
         {
             _activeDev = &_fujiDev->bootdisk;
 
@@ -263,7 +261,7 @@ void systemBus::_sio_process_cmd()
             // SIO status calls (of the 26 Atari sends) so a real D1:
             // can take over. Once status_waint_count expires, respond
             // normally; if disabled, respond immediately.
-            if (_activeDev->status_wait_count > 0 && tempFrame.comnd == 'R' && _fujiDev->status_wait_enabled)
+            if (_activeDev->status_wait_count > 0 && tmpFrame.command() == DISKCMD_READ && _fujiDev->status_wait_enabled)
             {
                 Debug_printf("Disabling CONFIG boot.\n");
                 _fujiDev->boot_config = false;
@@ -273,13 +271,13 @@ void systemBus::_sio_process_cmd()
             {
                 Debug_println("FujiNet CONFIG boot");
                 // handle command
-                _activeDev->sio_process(tempFrame.commanddata, tempFrame.checksum);
+                _activeDev->sio_process(tmpFrame);
             }
         }
         else
         {
             // Command FUJI_DEVICEID_TYPE3POLL is a Type3 poll - send it to every device that cares
-            if (tempFrame.device == FUJI_DEVICEID_TYPE3POLL)
+            if (tmpFrame.device() == FUJI_DEVICEID_TYPE3POLL)
             {
                 Debug_println("SIO TYPE3 POLL");
                 for (auto devicep : _daisyChain)
@@ -289,7 +287,7 @@ void systemBus::_sio_process_cmd()
                         Debug_printf("Sending TYPE3 poll to dev %x\n", devicep->_devnum);
                         _activeDev = devicep;
                         // handle command
-                        _activeDev->sio_process(tempFrame.commanddata, tempFrame.checksum);
+                        _activeDev->sio_process(tmpFrame);
                     }
                 }
             }
@@ -299,11 +297,11 @@ void systemBus::_sio_process_cmd()
                 // or go back to WAIT
                 for (auto devicep : _daisyChain)
                 {
-                    if (tempFrame.device == devicep->_devnum)
+                    if (tmpFrame.device() == devicep->_devnum)
                     {
                         _activeDev = devicep;
                         // handle command
-                        _activeDev->sio_process(tempFrame.commanddata, tempFrame.checksum);
+                        _activeDev->sio_process(tmpFrame);
                     }
                 }
             }
@@ -695,6 +693,8 @@ int systemBus::getCurrentBaudrate()
 // changed here.
 void systemBus::setBaudrate(int baud)
 {
+    flushOutput();
+
     // Yah this looks stupid but C++ doesn't do true polymorphism
     if (isBoIP())
         _netsio.setBaudrate(baud);
@@ -975,5 +975,4 @@ bool systemBus::commandAsserted()
     return false;
 #endif /* ESP_PLATFORM */
 }
-
 #endif /* BUILD_ATARI */

@@ -139,7 +139,12 @@ void netstream_activate()
         Config.get_network_netstream_register());
 #endif /* ATARI */
 #ifdef BUILD_LYNX
-    SYSTEM_BUS.setStreamHost(Config.get_network_netstream_host().c_str(), Config.get_network_netstream_port());
+    SYSTEM_BUS.setStreamHostWithOptions(
+        Config.get_network_netstream_host().c_str(),
+        Config.get_network_netstream_port(),
+        (Config.get_network_netstream_mode() == 0) ? 0 : 1,
+        Config.get_network_netstream_register(),
+        true);
 #endif /* LYNX */
 }
 
@@ -259,6 +264,16 @@ void fnHttpServiceConfigurator::config_modem_sniffer_enabled(std::string modem_s
 
     // Store
     Config.store_modem_sniffer_enabled(atoi(modem_sniffer_enabled.c_str()));
+    // Save*
+    Config.save();
+}
+
+void fnHttpServiceConfigurator::config_modem_connect_delay_ms(std::string modem_connect_delay_ms)
+{
+    Debug_printf("New Modem Connect Delay Value: %s\n", modem_connect_delay_ms.c_str());
+
+    // Store
+    Config.store_modem_connect_delay_ms(strtoul(modem_connect_delay_ms.c_str(), nullptr, 10));
     // Save*
     Config.save();
 }
@@ -744,6 +759,10 @@ int fnHttpServiceConfigurator::process_config_post(const char *postdata, size_t 
         {
             config_modem_sniffer_enabled(i->second);
         }
+        else if (i->first.compare("modem_connect_delay_ms") == 0)
+        {
+            config_modem_connect_delay_ms(i->second);
+        }
         else if (i->first.compare("passphrase_encrypt") == 0)
         {
             config_encrypt_passphrase_enabled(i->second);
@@ -825,3 +844,4 @@ int fnHttpServiceConfigurator::process_config_post(const char *postdata, size_t 
 
     return 0;
 }
+#include <cstdlib>

@@ -146,7 +146,7 @@ set(INCLUDE_DIRS include
     lib/webdav lib/http lib/sam lib/task
     lib/modem-sniffer lib/printer-emulator
     lib/network-protocol
-    lib/fuji lib/bus lib/device lib/media
+    lib/fuji lib/bus lib/device lib/device/fujiDevice lib/media
     lib/encrypt lib/base64
     lib/devrelay/commands lib/devrelay/service lib/devrelay/slip lib/devrelay/types
     lib/encoding
@@ -288,10 +288,11 @@ set(SOURCES src/main.cpp
     lib/device/printer.h
     lib/device/modem.h
     lib/device/cassette.h
-    lib/device/fujiDevice.h lib/device/fujiDevice.cpp
-    lib/device/FujiDeviceMixin.h
-    lib/device/Base64Mixin.h lib/device/Base64Mixin.cpp
-    lib/device/HashMixin.h lib/device/HashMixin.cpp
+    lib/device/fujiDevice/fujiDevice.h lib/device/fujiDevice/fujiDevice.cpp
+    lib/device/fujiDevice/FujiDeviceMixin.h
+    lib/device/fujiDevice/Base64Mixin.h lib/device/fujiDevice/Base64Mixin.cpp
+    lib/device/fujiDevice/HashMixin.h lib/device/fujiDevice/HashMixin.cpp
+    lib/device/fujiDevice/QRMixin.h lib/device/fujiDevice/QRMixin.cpp
     lib/device/network.h
     lib/device/netstream.h
     lib/device/siocpm.h
@@ -310,6 +311,7 @@ if(FUJINET_TARGET STREQUAL "ATARI")
     list(APPEND SOURCES
 
     lib/bus/sio/sio.h lib/bus/sio/sio.cpp
+    lib/bus/sio/FujiSIOPacket.h lib/bus/sio/FujiSIOPacket.cpp
     lib/bus/sio/NetSIO.h lib/bus/sio/NetSIO.cpp
     lib/media/atari/diskType.h lib/media/atari/diskType.cpp
     lib/media/atari/diskTypeAtr.h lib/media/atari/diskTypeAtr.cpp
