@@ -23,7 +23,7 @@
 #endif
 
 
-void sioCPM::sio_status()
+void sioCPM::sio_status(const FujiSIOPacket &packet)
 {
     // Nothing to do here
     return;
@@ -68,23 +68,20 @@ void sioCPM::init_cpm(int baud)
     memset(pattern, 0, sizeof(pattern));
 }
 
-void sioCPM::sio_process(uint32_t commanddata, uint8_t checksum)
+void sioCPM::sio_process(const FujiSIOPacket &packet)
 {
-    cmdFrame.commanddata = commanddata;
-    cmdFrame.checksum = checksum;
-
-    switch (cmdFrame.comnd)
+    switch (packet.command())
     {
-    case 'G':
-        sio_ack();
+    case CPMCMD_INIT:
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         fnSystem.delay(10);
-        sio_complete();
+        SYSTEM_BUS.transaction_success();
         fnSystem.delay(5000);
         init_cpm(9600);
         cpmActive = true;
         break;
     default:
-        sio_nak();
+        SYSTEM_BUS.transaction_error();
         break;
     }
 }

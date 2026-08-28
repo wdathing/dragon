@@ -18,6 +18,7 @@
 
 
 #define COMLYNX_BAUDRATE 62500
+#define COMLYNX_IDLE_TIME 500
 
 #define COMLYNX_RESET_DEBOUNCE_PERIOD 100 // in ms
 
@@ -58,7 +59,7 @@ protected:
     virtual void comlynx_response_nack();
 
     transState_t _transaction_state = TRANS_STATE::INVALID;
-    virtual void transaction_continue(transState_t expectMoreData);
+    virtual void transaction_begin(transState_t expectMoreData);
     virtual void transaction_complete();
     virtual void transaction_error();
     virtual success_is_true transaction_get(void *data, size_t len);
@@ -136,6 +137,8 @@ public:
     void shutdown();
     void reset();
 
+    void change_baud(int32_t baud);
+
     /**
      * @brief Wait to see if Comlynx bus is idle.
      */
@@ -153,7 +156,8 @@ public:
     void changeDeviceId(virtualDevice *pDevice, int device_id);
     bool deviceEnabled(fujiDeviceID_t device_id);
     QueueHandle_t qComlynxMessages = nullptr;
-    void setStreamHost(const char *newhost, int port);    
+    void setStreamHost(const char *newhost, int port);
+    void setStreamHostWithOptions(const char *newhost, int port, int mode, bool register_enabled, bool redeye_enabled);
 
     void setRedeyeMode(bool enable);
     void setRedeyeGameRemap(uint32_t remap);

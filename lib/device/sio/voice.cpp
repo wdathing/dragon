@@ -200,9 +200,7 @@ void sioVoice::sio_write()
 
     memset(sioBuffer, 0, n); // clear buffer
 
-    ck = bus_to_peripheral(sioBuffer, n);
-
-    if (ck == sio_checksum(sioBuffer, n))
+    if (SYSTEM_BUS.transaction_get(sioBuffer, n))
     {
         // append sioBuffer onto lineBuffer until EOL is reached
         // move this logic to append \0 into sio_write
@@ -225,16 +223,16 @@ void sioVoice::sio_write()
             }
             i++;
         }
-        sio_complete();
+        SYSTEM_BUS.transaction_success();
     }
     else
     {
-        sio_error();
+        SYSTEM_BUS.transaction_error();
     }
 }
 
 // Status
-void sioVoice::sio_status()
+void sioVoice::sio_status(const FujiSIOPacket &packet)
 {
     // act like a printer for POC
     uint8_t status[4];
@@ -244,29 +242,26 @@ void sioVoice::sio_status()
     status[2] = 15; // set timeout > 10 seconds (SAM audio buffer)
     status[3] = 0;
 
-    bus_to_computer(status, sizeof(status), false);
+    SYSTEM_BUS.transaction_send(status, sizeof(status), false);
 }
 
-void sioVoice::sio_process(uint32_t commanddata, uint8_t checksum)
+void sioVoice::sio_process(const FujiSIOPacket &packet)
 {
-    cmdFrame.commanddata = commanddata;
-    cmdFrame.checksum = checksum;
-
     // act like a printer for POC
-    switch (cmdFrame.comnd)
+    switch (packet.command())
     {
     case 'P': // 0x50
     case 'W': // 0x57
-        sio_late_ack();
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
         sio_write();
-        lastAux1 = cmdFrame.aux1;
+        lastAux1 = packet.param(0);
         break;
     case 'S': // 0x53
-        sio_ack();
-        sio_status();
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+        sio_status(packet);
         break;
     default:
-        sio_nak();
+        SYSTEM_BUS.transaction_error();
     }
 }
 

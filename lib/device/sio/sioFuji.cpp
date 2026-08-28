@@ -1,10 +1,10 @@
 #ifdef BUILD_ATARI
 
 #include "sioFuji.h"
-#include "httpService.h"
+#include "fsFlash.h"
+#include "fnFsSD.h"
 #include "utils.h"
 #include "base64.h"
-#include "../../qrcode/qrmanager.h"
 #include "compat_string.h"
 #include "fuji_endian.h"
 #include "siocpm.h"
@@ -141,26 +141,26 @@ sioFuji::sioFuji() : fujiDevice(MAX_DISK_DEVICES, IMAGE_EXTENSION, LOBBY_URL)
 }
 
 // Set SSID
-void sioFuji::sio_net_set_ssid()
+void sioFuji::sio_net_set_ssid(const FujiSIOPacket &packet)
 {
     SSIDConfig cfg;
-    transaction_continue(TRANS_STATE::WILL_GET);
+    transaction_begin(TRANS_STATE::WILL_GET);
     if (!transaction_get(&cfg, sizeof(cfg))) {
         transaction_error();
         return;
     }
 
-    fujicore_net_set_ssid_success(cfg.ssid, cfg.password, cmdFrame.aux1);
+    fujicore_net_set_ssid_success(cfg.ssid, cfg.password, packet.param(0));
     transaction_complete();
 }
 
 // Set SIO baudrate
-void sioFuji::sio_set_baudrate()
+void sioFuji::sio_set_baudrate(const FujiSIOPacket &packet)
 {
 
     int br = 0;
 
-    switch(cmdFrame.aux1) {
+    switch(packet.param8(0)) {
 
         case 0:
             br = 19200;
@@ -198,7 +198,6 @@ void sioFuji::sio_set_baudrate()
     // send complete with current baudrate
     transaction_complete();
 
-    SYSTEM_BUS.flushOutput();
 #ifndef ESP_PLATFORM
     fnSystem.delay_microseconds(2000);
 #endif
@@ -206,7 +205,7 @@ void sioFuji::sio_set_baudrate()
 }
 
 // Do SIO copy
-void sioFuji::sio_copy_file()
+void sioFuji::sio_copy_file(const FujiSIOPacket &packet)
 {
     uint8_t csBuf[256];
     std::string copySpec;
@@ -226,18 +225,16 @@ void sioFuji::sio_copy_file()
 
     if (dataBuf == nullptr)
     {
-        sio_error();
+        transaction_error();
         return;
     }
 
     memset(&csBuf, 0, sizeof(csBuf));
 
-    sio_late_ack(); // quick fix to permit copy to work again
-    ck = bus_to_peripheral(csBuf, sizeof(csBuf));
-
-    if (ck != sio_checksum(csBuf, sizeof(csBuf)))
+    transaction_begin(TRANS_STATE::WILL_GET); // quick fix to permit copy to work again
+    if (!transaction_get(csBuf, sizeof(csBuf)))
     {
-        sio_error();
+        transaction_error();
         free(dataBuf);
         return;
     }
@@ -249,27 +246,22 @@ void sioFuji::sio_copy_file()
     // Check for malformed copyspec.
     if (copySpec.empty() || copySpec.find_first_of("|") == std::string::npos)
     {
-        sio_error();
+        transaction_error();
         free(dataBuf);
         return;
     }
 
-    if (cmdFrame.aux1 < 1 || cmdFrame.aux1 > 8)
+    sourceSlot = packet.param(0);
+    destSlot = packet.param(1);
+
+    sourceSlot--, destSlot--;
+
+    if (!validate_host_slot(sourceSlot) || !validate_host_slot(destSlot))
     {
-        sio_error();
+        transaction_error();
         free(dataBuf);
         return;
     }
-
-    if (cmdFrame.aux2 < 1 || cmdFrame.aux2 > 8)
-    {
-        sio_error();
-        free(dataBuf);
-        return;
-    }
-
-    sourceSlot = cmdFrame.aux1 - 1;
-    destSlot = cmdFrame.aux2 - 1;
 
     // All good, after this point...
 
@@ -294,7 +286,7 @@ void sioFuji::sio_copy_file()
 
     if (sourceFile == nullptr)
     {
-        sio_error();
+        transaction_error();
         free(dataBuf);
         return;
     }
@@ -303,7 +295,7 @@ void sioFuji::sio_copy_file()
 
     if (destFile == nullptr)
     {
-        sio_error();
+        transaction_error();
         fnio::fclose(sourceFile);
         free(dataBuf);
         return;
@@ -338,12 +330,12 @@ void sioFuji::sio_copy_file()
     {
         // Remove the destination file and error
         _fnHosts[destSlot].file_remove((char *)destPath.c_str());
-        sio_error();
+        transaction_error();
         Debug_printf("Copy File Error! wCount: %d, rCount: %d, rTotal: %d, Expect: %d\n", writeCount, readCount, readTotal, expected);
     }
     else
     {
-        sio_complete();
+        transaction_complete();
     }
 
     // copyEnd:
@@ -422,7 +414,7 @@ size_t sioFuji::set_additional_direntry_details(fsdir_entry_t *f, uint8_t *dest,
 //  Make new disk and shove into device slot
 void sioFuji::sio_new_disk()
 {
-    transaction_continue(TRANS_STATE::WILL_GET);
+    transaction_begin(TRANS_STATE::WILL_GET);
     Debug_println("Fuji cmd: NEW DISK");
 
     struct
@@ -486,12 +478,12 @@ void sioFuji::sio_new_disk()
 
 // AUX1 is our index value (from 0 to SIO_HISPEED_LOWEST_INDEX, for FN-PC 0 .. 10, 16)
 // AUX2 requests a save of the change if set to 1
-void sioFuji::sio_set_hsio_index()
+void sioFuji::sio_set_hsio_index(const FujiSIOPacket &packet)
 {
     Debug_println("Fuji cmd: SET HSIO INDEX");
 
     // DAUX1 holds the desired index value
-    uint8_t index = cmdFrame.aux1;
+    uint8_t index = packet.param(0);
 
     // Make sure it's a valid value
 #ifdef ESP_PLATFORM
@@ -507,13 +499,64 @@ void sioFuji::sio_set_hsio_index()
     SYSTEM_BUS.setHighSpeedIndex(index);
 
     // Go ahead and save it if AUX2 = 1
-    if (cmdFrame.aux2 & 1)
+    if (packet.param8(1) & 1)
     {
         Config.store_general_hsioindex(index);
         Config.save();
     }
 
     transaction_complete();
+}
+
+// Mounts the desired boot disk, honoring alternate SD config and CONFIG-NG settings.
+void sioFuji::insert_boot_device(uint8_t image_id, mediatype_t disk_type,
+                                 DISK_DEVICE *disk_dev)
+{
+    if (image_id != 0)
+    {
+        fujiDevice::insert_boot_device(image_id, disk_type, disk_dev);
+        return;
+    }
+
+    std::string altconfigfile = Config.get_config_filename();
+    fnFile *fBoot = nullptr;
+    size_t image_size = 0;
+    std::string boot_img;
+
+    if (!altconfigfile.empty() && fnSDFAT.running())
+    {
+        fBoot = fnSDFAT.fnfile_open(altconfigfile.c_str());
+        if (fBoot != nullptr)
+        {
+            boot_img = altconfigfile;
+            image_size = FileSystem::filesize(fBoot);
+            Debug_printf("Mounted Alternate CONFIG %s\n", boot_img.c_str());
+            disk_dev->mount(fBoot, boot_img.c_str(), image_size, DISK_ACCESS_MODE_READ, disk_type);
+            disk_dev->is_config_device = true;
+            return;
+        }
+    }
+
+    if (Config.get_general_config_ng())
+    {
+        boot_img = "/autorun-cng" + _diskImageExtension;
+        Debug_printf("Mounted CONFIG-NG\n");
+    }
+    else
+    {
+        boot_img = "/autorun" + _diskImageExtension;
+    }
+
+    fBoot = fsFlash.fnfile_open(boot_img.c_str());
+    if (fBoot == nullptr)
+    {
+        Debug_printf("Failed to open boot disk image: %s\n", boot_img.c_str());
+        return;
+    }
+
+    image_size = fsFlash.filesize(fBoot);
+    disk_dev->mount(fBoot, boot_img.c_str(), image_size, DISK_ACCESS_MODE_READ, disk_type);
+    disk_dev->is_config_device = true;
 }
 
 // Initializes base settings and adds our devices to the SIO bus
@@ -547,11 +590,11 @@ void sioFuji::setup()
 }
 
 // Set NetStream HOST, PORT, and options, then start it.
-void sioFuji::sio_enable_netstream()
+void sioFuji::sio_enable_netstream(const FujiSIOPacket &packet)
 {
     char host[64];
 
-    transaction_continue(TRANS_STATE::WILL_GET);
+    transaction_begin(TRANS_STATE::WILL_GET);
     if (!transaction_get(&host, sizeof(host)))
     {
         transaction_error();
@@ -591,7 +634,8 @@ void sioFuji::sio_enable_netstream()
     memcpy(host_out, host, copy_len);
     host_out[copy_len] = '\0';
 
-    int port = (cmdFrame.aux1 << 8) | cmdFrame.aux2;
+    uint16_t port = (static_cast<uint16_t>(packet.param8(0)) << 8) |
+                    packet.param8(1);
 
     Debug_printf("Fuji cmd ENABLE NETSTREAM: HOST:%s PORT: %d\n", host_out, port);
 #ifdef DEBUG_NETSTREAM
@@ -621,410 +665,55 @@ void sioFuji::sio_enable_netstream()
                                         has_audf3);
 }
 
-void sioFuji::sio_qrcode_input()
-{
-    transaction_continue(TRANS_STATE::WILL_GET);
-
-    uint16_t len = sio_get_aux();
-
-    Debug_printf("FUJI: QRCODE INPUT (len: %d)\n", len);
-
-    if (!len)
-    {
-        Debug_printf("Invalid length. Aborting");
-        transaction_error();
-        return;
-    }
-
-    std::vector<unsigned char> p(len);
-    transaction_get(p.data(), len);
-    _qrManager.data += std::string((const char *)p.data(), len);
-    transaction_complete();
-}
-
-void sioFuji::sio_qrcode_encode()
-{
-    uint16_t aux = sio_get_aux();
-    uint8_t version = aux & 0b01111111;
-    uint8_t ecc_mode = ((aux >> 8) & 0b00000011);
-    bool shorten = (aux >> 12) & 0b00000001;
-
-    Debug_printf("FUJI: QRCODE ENCODE\n");
-    Debug_printf("QR Version: %d, ECC: %d, Shorten: %s\n", version, ecc_mode, shorten ? "Y" : "N");
-
-    std::string url = _qrManager.data;
-
-    if (shorten) {
-        url = fnHTTPD.shorten_url(url);
-    }
-
-    _qrManager.version(version);
-    _qrManager.ecc((qr_ecc_t)ecc_mode);
-    _qrManager.output_mode = QR_OUTPUT_MODE_ATASCII;
-    _qrManager.encode();
-
-    _qrManager.data.clear();
-
-    if (!_qrManager.code.size())
-    {
-        Debug_printf("QR code encoding failed\n");
-        transaction_error();
-        return;
-    }
-
-    Debug_printf("Resulting QR code is: %u modules\n", _qrManager.code.size());
-    transaction_complete();
-}
-
-void sioFuji::sio_qrcode_length()
-{
-    Debug_printf("FUJI: QRCODE LENGTH\n");
-    uint8_t output_mode = sio_get_aux();
-    Debug_printf("Output mode: %i\n", output_mode);
-
-    size_t len = _qrManager.size();
-
-    // A bit gross to have a side effect from length command, but not enough aux bytes
-    // to specify version, ecc, *and* output mode for the encode command. Also can't
-    // just wait for output command, because output mode determines buffer length,
-    if (len && (output_mode != _qrManager.output_mode)) {
-        _qrManager.output_mode = (ouput_mode_t)output_mode;
-        _qrManager.encode();
-        len = _qrManager.code.size();
-    }
-
-    uint8_t response[4] = {
-        (uint8_t)(len >> 0),
-        (uint8_t)(len >> 8),
-        (uint8_t)(len >> 16),
-        (uint8_t)(len >> 24)
-    };
-
-    if (!len)
-    {
-        Debug_printf("QR code buffer is 0 bytes, sending error.\n");
-        bus_to_computer(response, sizeof(response), true);
-    }
-
-    Debug_printf("QR code buffer length: %u bytes\n", len);
-
-    bus_to_computer(response, sizeof(response), false);
-}
-
-void sioFuji::sio_qrcode_output()
-{
-    Debug_printf("FUJI: QRCODE OUTPUT\n");
-
-    size_t len = sio_get_aux();
-
-    if (!len)
-    {
-        Debug_printf("Refusing to send a zero byte buffer. Aborting\n");
-        return;
-    }
-    else if (len > _qrManager.size())
-    {
-        Debug_printf("Requested %u bytes, but buffer is only %u bytes, aborting.\n", len, _qrManager.code.size());
-        return;
-    }
-    else
-    {
-        Debug_printf("Requested %u bytes\n", len);
-    }
-
-    bus_to_computer(&_qrManager.code[0], len, false);
-
-    _qrManager.code.clear();
-    _qrManager.code.shrink_to_fit();
-}
-
-void sioFuji::sio_base64_encode_input()
-{
-    transaction_continue(TRANS_STATE::WILL_GET);
-
-    uint16_t len = sio_get_aux();
-
-    Debug_printf("FUJI: BASE64 ENCODE INPUT\n");
-
-    if (!len)
-    {
-        Debug_printf("Invalid length. Aborting");
-        transaction_error();
-        return;
-    }
-
-    std::vector<unsigned char> p(len);
-    transaction_get(p.data(), len);
-    base64.base64_buffer += std::string((const char *)p.data(), len);
-    transaction_complete();
-}
-
-void sioFuji::sio_base64_encode_compute()
-{
-    size_t out_len;
-
-    /* ACK before CPU work (matches sio_hash_compute); NetSIO/tight SIO timing
-     * otherwise leaves the host waiting past dtimlo (Atari status 138 timeout). */
-    transaction_continue(TRANS_STATE::NO_GET);
-
-    Debug_printf("FUJI: BASE64 ENCODE COMPUTE\n");
-
-    std::unique_ptr<char[]> p = Base64::encode(base64.base64_buffer.c_str(), base64.base64_buffer.size(), &out_len);
-    if (!p)
-    {
-        Debug_printf("base64_encode compute failed\n");
-        transaction_error();
-        return;
-    }
-
-    base64.base64_buffer.clear();
-    base64.base64_buffer = std::string(p.get(), out_len);
-
-    Debug_printf("Resulting BASE64 encoded data is: %u bytes\n", out_len);
-    transaction_complete();
-}
-
-void sioFuji::sio_base64_encode_length()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: BASE64 ENCODE LENGTH\n");
-
-    size_t l = base64.base64_buffer.length();
-    uint8_t response[4] = {
-        (uint8_t)(l >>  0),
-        (uint8_t)(l >>  8),
-        (uint8_t)(l >>  16),
-        (uint8_t)(l >>  24)
-    };
-
-    if (!l)
-    {
-        Debug_printf("BASE64 buffer is 0 bytes, sending error.\n");
-        transaction_put(response, sizeof(response), true);
-        return;
-    }
-
-    Debug_printf("base64 buffer length: %u bytes\n", l);
-
-    transaction_put(response, sizeof(response), false);
-}
-
-void sioFuji::sio_base64_encode_output()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: BASE64 ENCODE OUTPUT\n");
-
-    size_t len = sio_get_aux();
-
-    if (!len)
-    {
-        Debug_printf("Refusing to send a zero byte buffer. Aborting\n");
-        transaction_error();
-        return;
-    }
-    else if (len > base64.base64_buffer.length())
-    {
-        Debug_printf("Requested %u bytes, but buffer is only %u bytes, aborting.\n", len, base64.base64_buffer.length());
-        transaction_error();
-        return;
-    }
-    else
-    {
-        Debug_printf("Requested %u bytes\n", len);
-    }
-
-    std::vector<unsigned char> p(len);
-    std::memcpy(p.data(), base64.base64_buffer.data(), len);
-    base64.base64_buffer.erase(0, len);
-    base64.base64_buffer.shrink_to_fit();
-
-    transaction_put(p.data(), len, false);
-}
-
 void sioFuji::sio_random_number()
 {
+    transaction_begin(TRANS_STATE::NO_GET);
     int r = rand();
-    transaction_put(&r,sizeof(int),true);
+    transaction_put(&r,sizeof(int),false);
 }
 
-void sioFuji::sio_base64_decode_input()
+// Set an external clock rate in kHz defined by speed in steps of 2kHz.
+void sioFuji::fujicmd_set_sio_external_clock(uint16_t speed)
 {
-    transaction_continue(TRANS_STATE::WILL_GET);
+    transaction_begin(TRANS_STATE::NO_GET);
 
-    uint16_t len = sio_get_aux();
+    int baudRate = speed * 1000;
 
-    Debug_printf("FUJI: BASE64 DECODE INPUT\n");
+    Debug_printf("sioFuji::fujicmd_set_external_clock(%u)\n", baudRate);
 
-    if (!len)
+    if (speed == 0)
     {
-        Debug_printf("Invalid length. Aborting");
-        transaction_error();
-        return;
-    }
-
-    std::vector<unsigned char> p(len);
-    transaction_get(p.data(), len);
-    base64.base64_buffer += std::string((const char *)p.data(), len);
-    transaction_complete();
-}
-
-void sioFuji::sio_base64_decode_compute()
-{
-    size_t out_len;
-
-    transaction_continue(TRANS_STATE::NO_GET);
-
-    Debug_printf("FUJI: BASE64 DECODE COMPUTE\n");
-
-    std::unique_ptr<unsigned char[]> p = Base64::decode(base64.base64_buffer.c_str(), base64.base64_buffer.size(), &out_len);
-    if (!p)
-    {
-        Debug_printf("base64_encode compute failed\n");
-        transaction_error();
-        return;
-    }
-
-    base64.base64_buffer.clear();
-    base64.base64_buffer = std::string((const char *)p.get(), out_len);
-
-    Debug_printf("Resulting BASE64 encoded data is: %u bytes\n", out_len);
-    transaction_complete();
-}
-
-void sioFuji::sio_base64_decode_length()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: BASE64 DECODE LENGTH\n");
-
-    size_t len = base64.base64_buffer.length();
-    uint8_t response[4] = {
-        (uint8_t)(len >>  0),
-        (uint8_t)(len >>  8),
-        (uint8_t)(len >>  16),
-        (uint8_t)(len >>  24)
-    };
-
-    if (!len)
-    {
-        Debug_printf("BASE64 buffer is 0 bytes, sending error.\n");
-        transaction_put(response, sizeof(response), true);
-        return;
-    }
-
-    Debug_printf("base64 buffer length: %u bytes\n", len);
-
-    transaction_put(response, sizeof(response), false);
-}
-
-void sioFuji::sio_base64_decode_output()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: BASE64 DECODE OUTPUT\n");
-
-    size_t len = sio_get_aux();
-
-    if (!len)
-    {
-        Debug_printf("Refusing to send a zero byte buffer. Aborting\n");
-        transaction_error();
-        return;
-    }
-    else if (len > base64.base64_buffer.length())
-    {
-        Debug_printf("Requested %u bytes, but buffer is only %u bytes, aborting.\n", len, base64.base64_buffer.length());
-        transaction_error();
-        return;
+        SYSTEM_BUS.setUltraHigh(false, 0);
     }
     else
     {
-        Debug_printf("Requested %u bytes\n", len);
+        SYSTEM_BUS.setUltraHigh(true, baudRate);
     }
 
-    std::vector<unsigned char> p(len);
-    memcpy(p.data(), base64.base64_buffer.data(), len);
-    base64.base64_buffer.erase(0, len);
-    base64.base64_buffer.shrink_to_fit();
-    transaction_put(p.data(), len, false);
-}
-
-void sioFuji::sio_hash_input()
-{
-    transaction_continue(TRANS_STATE::WILL_GET);
-
-    Debug_printf("FUJI: HASH INPUT\n");
-    uint16_t len = sio_get_aux();
-    if (!len)
-    {
-        Debug_printf("Invalid length. Aborting");
-        transaction_error();
-        return;
-    }
-
-    std::vector<unsigned char> p(len);
-    transaction_get(p.data(), len);
-    hasher.add_data(p);
     transaction_complete();
 }
 
-void sioFuji::sio_hash_compute(bool clear_data)
+void sioFuji::sio_process(const FujiSIOPacket &packet)
 {
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: HASH COMPUTE\n");
-    algorithm = Hash::to_algorithm(sio_get_aux());
-    hasher.compute(algorithm, clear_data);
-    transaction_complete();
-}
-
-void sioFuji::sio_hash_length()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: HASH LENGTH\n");
-    uint16_t is_hex = sio_get_aux() == 1;
-    uint8_t r = hasher.hash_length(algorithm, is_hex);
-    transaction_put(&r, 1, false);
-}
-
-void sioFuji::sio_hash_output()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: HASH OUTPUT\n");
-    uint16_t is_hex = sio_get_aux() == 1;
-
-    std::vector<uint8_t> hashed_data;
-    if (is_hex) {
-        std::string hex = hasher.output_hex();
-        hashed_data.insert(hashed_data.end(), hex.begin(), hex.end());
-    } else {
-        hashed_data = hasher.output_binary();
-    }
-    transaction_put(hashed_data.data(), hashed_data.size(), false);
-}
-
-void sioFuji::sio_hash_clear()
-{
-    transaction_continue(TRANS_STATE::NO_GET);
-    Debug_printf("FUJI: HASH CLEAR\n");
-    hasher.clear();
-    transaction_complete();
-}
-
-void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
-{
-    cmdFrame.commanddata = commanddata;
-    cmdFrame.checksum = checksum;
-
     Debug_printf("sioFuji::fujicmd_process() called, baud: %d\n", SYSTEM_BUS.getBaudrate());
 
-    switch (cmdFrame.comnd)
+    // Let the base class handle standard commands
+    if (fujiDevice::processCommand(packet))
+        return;
+
+    switch (packet.command())
     {
     case FUJICMD_HSIO_INDEX:
+        /* ACK is required here since it's not done elsewhere for this device/command. The bus should probably
+        * handle this instead. Disk and network devices currently send their own ACK for this
+        */
         sio_high_speed();
         break;
     case FUJICMD_SET_HSIO_INDEX:
-        sio_set_hsio_index();
+        sio_set_hsio_index(packet);
         break;
     case FUJICMD_STATUS:
-        sio_status();
+        sio_status(packet);
         break;
     case FUJICMD_RESET:
         fujicmd_reset();
@@ -1033,10 +722,10 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         fujicmd_net_scan_networks();
         break;
     case FUJICMD_GET_SCAN_RESULT:
-        fujicmd_net_scan_result(cmdFrame.aux1);
+        fujicmd_net_scan_result(packet.param(0));
         break;
     case FUJICMD_SET_SSID:
-        sio_net_set_ssid();
+        sio_net_set_ssid(packet);
         break;
     case FUJICMD_GET_SSID:
         fujicmd_net_get_ssid();
@@ -1045,16 +734,16 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         fujicmd_net_get_wifi_status();
         break;
     case FUJICMD_MOUNT_HOST:
-        fujicmd_mount_host_success(cmdFrame.aux1);
+        fujicmd_mount_host_success(packet.param8(0));
         break;
     case FUJICMD_MOUNT_IMAGE:
-        fujicmd_mount_disk_image_success(cmdFrame.aux1, (disk_access_flags_t) cmdFrame.aux2);
+        fujicmd_mount_disk_image_success(packet.param(0), (disk_access_flags_t) packet.param8(1));
         break;
     case FUJICMD_OPEN_DIRECTORY:
-        fujicmd_open_directory_success(cmdFrame.aux1);
+        fujicmd_open_directory_success(packet.param(0));
         break;
     case FUJICMD_READ_DIR_ENTRY:
-        fujicmd_read_directory_entry(cmdFrame.aux1, cmdFrame.aux2);
+        fujicmd_read_directory_entry(packet.param8(0), packet.param(1));
         break;
     case FUJICMD_CLOSE_DIRECTORY:
         fujicmd_close_directory();
@@ -1063,7 +752,7 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         fujicmd_get_directory_position();
         break;
     case FUJICMD_SET_DIRECTORY_POSITION:
-        fujicmd_set_directory_position(le16toh(cmdFrame.aux12));
+        fujicmd_set_directory_position(packet.param(0));
         break;
     case FUJICMD_READ_HOST_SLOTS:
         fujicmd_read_host_slots();
@@ -1081,16 +770,16 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         fujicmd_net_get_wifi_enabled();
         break;
     case FUJICMD_SET_BAUDRATE:
-        sio_set_baudrate();
+        sio_set_baudrate(packet);
         break;
     case FUJICMD_UNMOUNT_IMAGE:
-        fujicmd_unmount_disk_image_success(cmdFrame.aux1);
+        fujicmd_unmount_disk_image_success(packet.param(0));
         break;
     case FUJICMD_GET_ADAPTERCONFIG:
         // THIS IS STILL NEEDED FOR BACKWARDS COMPATIBILITY WITH
         // FUJINET-LIB THAT SENDS 0xE8 FOR ADAPTER_CONFIG_EXTENDED
         // WITH 0x01 IN THE AUX1 BYTE
-        if (cmdFrame.aux1 == 1)
+        if (packet.param8(0) == 1)
             fujicmd_get_adapter_config_extended();
         else
             fujicmd_get_adapter_config();
@@ -1102,23 +791,23 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         sio_new_disk();
         break;
     case FUJICMD_UNMOUNT_HOST:
-        fujicmd_unmount_host_success(cmdFrame.aux1);
+        fujicmd_unmount_host_success(packet.param(0));
         break;
     case FUJICMD_SET_DEVICE_FULLPATH:
-        fujicmd_set_device_filename_success(cmdFrame.aux1, cmdFrame.aux2 >> 4,
-                                            (disk_access_flags_t) (cmdFrame.aux2 & 0x0F));
+        fujicmd_set_device_filename_success(packet.param(0), packet.param8(1) >> 4,
+                                            (disk_access_flags_t) (packet.param8(1) & 0x0F));
         break;
     case FUJICMD_SET_HOST_PREFIX:
-        fujicmd_set_host_prefix(cmdFrame.aux1);
+        fujicmd_set_host_prefix(packet.param(0));
         break;
     case FUJICMD_GET_HOST_PREFIX:
-        fujicmd_get_host_prefix(cmdFrame.aux1);
+        fujicmd_get_host_prefix(packet.param(0));
         break;
     case FUJICMD_SET_SIO_EXTERNAL_CLOCK:
-        fujicmd_set_sio_external_clock(le16toh(cmdFrame.aux12));
+        fujicmd_set_sio_external_clock(packet.param(0));
         break;
     case FUJICMD_WRITE_APPKEY:
-        fujicmd_write_app_key(le16toh(cmdFrame.aux12),
+        fujicmd_write_app_key(packet.param(0),
                               get_value_or_default(mode_to_keysize, _current_appkey.mode, 64));
         break;
     case FUJICMD_READ_APPKEY:
@@ -1131,76 +820,22 @@ void sioFuji::sio_process(uint32_t commanddata, uint8_t checksum)
         fujicmd_close_app_key();
         break;
     case FUJICMD_GET_DEVICE_FULLPATH:
-        fujicmd_get_device_filename(cmdFrame.aux1);
+        fujicmd_get_device_filename(packet.param(0));
         break;
     case FUJICMD_CONFIG_BOOT:
-        fujicmd_set_boot_config(cmdFrame.aux1);
+        fujicmd_set_boot_config(packet.param(0));
         break;
     case FUJICMD_COPY_FILE:
-        sio_copy_file();
+        sio_copy_file(packet);
         break;
     case FUJICMD_MOUNT_ALL:
         fujicmd_mount_all_success();
         break;
     case FUJICMD_SET_BOOT_MODE:
-        fujicmd_set_boot_mode(cmdFrame.aux1, MEDIATYPE_UNKNOWN, &bootdisk);
+        fujicmd_set_boot_mode(packet.param(0), MEDIATYPE_UNKNOWN, &bootdisk);
         break;
     case FUJICMD_ENABLE_UDPSTREAM:
-        sio_enable_netstream();
-        break;
-    case FUJICMD_QRCODE_INPUT:
-        sio_qrcode_input();
-        break;
-    case FUJICMD_QRCODE_ENCODE:
-        sio_qrcode_encode();
-        break;
-    case FUJICMD_QRCODE_LENGTH:
-        sio_qrcode_length();
-        break;
-    case FUJICMD_QRCODE_OUTPUT:
-        sio_qrcode_output();
-        break;
-    case FUJICMD_BASE64_ENCODE_INPUT:
-        sio_base64_encode_input();
-        break;
-    case FUJICMD_BASE64_ENCODE_COMPUTE:
-        sio_base64_encode_compute();
-        break;
-    case FUJICMD_BASE64_ENCODE_LENGTH:
-        sio_base64_encode_length();
-        break;
-    case FUJICMD_BASE64_ENCODE_OUTPUT:
-        sio_base64_encode_output();
-        break;
-    case FUJICMD_BASE64_DECODE_INPUT:
-        sio_base64_decode_input();
-        break;
-    case FUJICMD_BASE64_DECODE_COMPUTE:
-        sio_base64_decode_compute();
-        break;
-    case FUJICMD_BASE64_DECODE_LENGTH:
-        sio_base64_decode_length();
-        break;
-    case FUJICMD_BASE64_DECODE_OUTPUT:
-        sio_base64_decode_output();
-        break;
-    case FUJICMD_HASH_INPUT:
-        sio_hash_input();
-        break;
-    case FUJICMD_HASH_COMPUTE:
-        sio_hash_compute(true);
-        break;
-    case FUJICMD_HASH_COMPUTE_NO_CLEAR:
-        sio_hash_compute(false);
-        break;
-    case FUJICMD_HASH_LENGTH:
-        sio_hash_length();
-        break;
-    case FUJICMD_HASH_OUTPUT:
-        sio_hash_output();
-        break;
-    case FUJICMD_HASH_CLEAR:
-        sio_hash_clear();
+        sio_enable_netstream(packet);
         break;
     case FUJICMD_RANDOM_NUMBER:
         sio_random_number();
@@ -1227,7 +862,7 @@ success_is_true sioFuji::fujicore_mount_disk_image_success(uint8_t deviceSlot,
 // we override it here to pad/encode the same computed value as LE32.
 void sioFuji::fujicmd_net_scan_networks()
 {
-    transaction_continue(TRANS_STATE::NO_GET);
+    transaction_begin(TRANS_STATE::NO_GET);
     Debug_println("Fuji cmd: SCAN NETWORKS");
 
     char ret[4] = {0};

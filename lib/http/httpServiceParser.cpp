@@ -70,6 +70,7 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         FN_PRINTER_ENABLED,
         FN_MODEM_ENABLED,
         FN_MODEM_SNIFFER_ENABLED,
+        FN_MODEM_CONNECT_DELAY_MS,
 #if !defined(ESP_PLATFORM) || defined(BUILD_RS232)
         FN_SERIAL_PORT_BAUD,
 #endif
@@ -152,6 +153,8 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         FN_CPM_CCP,
         FN_ALT_CFG,
         FN_PCLINK_ENABLED,
+        FN_GDRIVE_CONNECTED,
+        FN_ONEDRIVE_CONNECTED,
         FN_LASTTAG
     };
 
@@ -204,6 +207,7 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         "FN_PRINTER_ENABLED",
         "FN_MODEM_ENABLED",
         "FN_MODEM_SNIFFER_ENABLED",
+        "FN_MODEM_CONNECT_DELAY_MS",
 #if !defined(ESP_PLATFORM) || defined(BUILD_RS232)
         "FN_SERIAL_PORT_BAUD",
 #endif
@@ -286,6 +290,8 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         "FN_CPM_CCP",
         "FN_ALT_CFG",
         "FN_PCLINK_ENABLED",
+        "FN_GDRIVE_CONNECTED",
+        "FN_ONEDRIVE_CONNECTED",
     };
 
     stringstream resultstream;
@@ -500,7 +506,7 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         resultstream << Config.get_general_status_wait_enabled();
         break;
     case FN_BOOT_MODE:
-        resultstream << Config.get_general_boot_mode();
+        resultstream << (unsigned int)Config.get_general_boot_mode();
         break;
     case FN_PRINTER_ENABLED:
         resultstream << Config.get_printer_enabled();
@@ -510,6 +516,9 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         break;
     case FN_MODEM_SNIFFER_ENABLED:
         resultstream << Config.get_modem_sniffer_enabled();
+        break;
+    case FN_MODEM_CONNECT_DELAY_MS:
+        resultstream << Config.get_modem_connect_delay_ms();
         break;
     case FN_BOIP_ENABLED:
         resultstream << Config.get_boip_enabled();
@@ -650,7 +659,7 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
                 {
                     strncat(result, "<option value=\"", MAX_PRINTER_LIST_BUFFER-1);
                     strncat(result, PRINTER_CLASS::printer_model_str[i], MAX_PRINTER_LIST_BUFFER-1);
-                    strncat(result, "\">", MAX_PRINTER_LIST_BUFFER);
+                    strncat(result, "\">", MAX_PRINTER_LIST_BUFFER - strlen(result) - 1);
                     strncat(result, PRINTER_CLASS::printer_model_str[i], MAX_PRINTER_LIST_BUFFER-1);
                     strncat(result, "</option>\n", MAX_PRINTER_LIST_BUFFER-1);
                 }
@@ -671,6 +680,13 @@ const string fnHttpServiceParser::substitute_tag(const string &tag)
         break;
     case FN_ALT_CFG:
         resultstream << Config.get_config_filename();
+        break;
+
+    case FN_GDRIVE_CONNECTED:
+        resultstream << (Config.get_gdrive_refresh_token().empty() ? "0" : "1");
+        break;
+    case FN_ONEDRIVE_CONNECTED:
+        resultstream << (Config.get_onedrive_refresh_token().empty() ? "0" : "1");
         break;
     default:
         resultstream << tag;

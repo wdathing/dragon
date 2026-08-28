@@ -1,10 +1,15 @@
 #ifndef SIO_H
 #define SIO_H
 
-#include "cmdFrame.h"
+#include "bus.h"
+#include "FujiSIOPacket.h"
 #include "UARTChannel.h"
 #include "NetSIO.h"
+#include "global_types.h"
 #include <forward_list>
+#include <cassert>
+
+#define FUJI_COMMAND_PACKET FujiSIOPacket
 
 #define DELAY_T4 850
 #define DELAY_T5 250
@@ -58,6 +63,12 @@ enum AtariSIODirection {
     SIO_DIRECTION_INVALID = 0xFF,
 };
 
+typedef enum class SIO_SPEED {
+    STANDARD,
+    HIGH,
+    ULTRA,
+} sioSpeedMode_t;
+
 // helper functions
 uint8_t sio_checksum(uint8_t *buf, unsigned short len);
 
@@ -79,87 +90,19 @@ class virtualDevice
 
 protected:
     fujiDeviceID_t _devnum;
-
-    cmdFrame_t cmdFrame;
     bool listen_to_type3_polls = false;
-
-    /**
-     * @brief Send the desired buffer to the Atari.
-     * @param buff The byte buffer to send to the Atari
-     * @param len The length of the buffer to send to the Atari.
-     * @return TRUE if the Atari processed the data in error, FALSE if the Atari successfully processed
-     * the data.
-     */
-    void bus_to_computer(uint8_t *buff, uint16_t len, bool err);
-
-    /**
-     * @brief Receive data from the Atari.
-     * @param buff The byte buffer provided for data from the Atari.
-     * @param len The length of the amount of data to receive from the Atari.
-     * @return An 8-bit wrap-around checksum calculated by the Atari, which should be checked with sio_checksum()
-     */
-    uint8_t bus_to_peripheral(uint8_t *buff, uint16_t len);
-
-    /**
-     * @brief Send an acknowledgement byte to the Atari 'A'
-     * This should be used if the command received by the SIO device is valid, and is used to signal to the
-     * Atari that we are now processing the command.
-     */
-    void sio_ack();
-
-    /**
-     * @brief Send an acknowledgement byte to the Atari 'A'
-     * - without NetSIO, send ACK as usually
-     * - with NetSIO, ACK is delayed untill we now how much data should be written by Atari to peripheral
-     *   ACK byte together with expected write size is send as part of SYNC_RESPONSE
-     */
-#ifdef ESP_PLATFORM
-    inline void sio_late_ack() { sio_ack(); };
-#else
-    void sio_late_ack();
-#endif
-
-    /**
-     * @brief Send a non-acknowledgement (NAK) to the Atari 'N'
-     * This should be used if the command received by the SIO device is invalid, in the first place. It is not
-     * the same as sio_error().
-     */
-    void sio_nak();
-
-    /**
-     * @brief Send a COMPLETE to the Atari 'C'
-     * This should be used after processing of the command to indicate that we've successfully finished. Failure to send
-     * either a COMPLETE or ERROR will result in a SIO TIMEOUT (138) to be reported in DSTATS.
-     */
-    void sio_complete();
-
-    /**
-     * @brief Send an ERROR to the Atari 'E'
-     * This should be used during or after processing of the command to indicate that an error resulted
-     * from processing the command, and that the Atari should probably re-try the command. Failure to
-     * send an ERROR or COMPLTE will result in a SIO TIMEOUT (138) to be reported in DSTATS.
-     */
-    void sio_error();
-
-    /**
-     * @brief Return the two aux bytes in cmdFrame as a single 16-bit value, commonly used, for example to retrieve
-     * a sector number, for disk, or a number of bytes waiting for the sioNetwork device.
-     *
-     * @return 16-bit value of DAUX1/DAUX2 in cmdFrame.
-     */
-    unsigned short sio_get_aux();
 
     /**
      * @brief All SIO commands by convention should return a status command, using bus_to_computer() to return
      * four bytes of status information to be put into DVSTAT ($02EA)
      */
-    virtual void sio_status() = 0;
+    virtual void sio_status(const FujiSIOPacket &packet) = 0;
 
     /**
      * @brief All SIO devices repeatedly call this routine to fan out to other methods for each command.
      * This is typcially implemented as a switch() statement.
      */
-    virtual void sio_process(uint32_t commanddata, uint8_t checksum) = 0;
+    virtual void sio_process(const FujiSIOPacket &packet) = 0;
 
     // Optional shutdown/reboot cleanup routine
     virtual void shutdown(){};
@@ -209,14 +152,17 @@ struct sio_message_t
 
 // typedef sio_message_t sio_message_t;
 
-class systemBus
+class systemBus : public SystemBusBase
 {
+    friend FujiSIOPacket;
+
 private:
     std::forward_list<virtualDevice *> _daisyChain;
 
     int _command_frame_counter = 0;
 
     virtualDevice *_activeDev = nullptr;
+    FujiSIOPacket *_activeFrame;
     modem *_modemDev = nullptr;
     sioFuji *_fujiDev = nullptr;
     sioNetwork *_netDev[8] = {nullptr};
@@ -225,7 +171,7 @@ private:
     sioCPM *_cpmDev = nullptr;
     sioPrinter *_printerdev = nullptr;
 
-    int _sioBaud = SIO_STANDARD_BAUDRATE;
+    sioSpeedMode_t _sioBaud = SIO_SPEED::STANDARD;
     int _sioHighSpeedIndex = SIO_HISPEED_INDEX;
     int _sioBaudHigh = SIO_STANDARD_BAUDRATE;
     int _sioBaudUltraHigh = SIO_STANDARD_BAUDRATE;
@@ -241,10 +187,53 @@ private:
     bool _command_processed = false;
 #endif
 
+    transState_t _transaction_state = TRANS_STATE::INVALID;
+
     void _sio_process_cmd();
     void _sio_process_queue();
 
     void configureGPIO();
+
+    /**
+     * @brief Send an acknowledgement byte to the Atari 'A'
+     * This should be used if the command received by the SIO device is valid, and is used to signal to the
+     * Atari that we are now processing the command.
+     */
+    void _sio_ack();
+
+    /**
+     * @brief Send an acknowledgement byte to the Atari 'A'
+     * - without NetSIO, send ACK as usually
+     * - with NetSIO, ACK is delayed untill we now how much data should be written by Atari to peripheral
+     *   ACK byte together with expected write size is send as part of SYNC_RESPONSE
+     */
+#ifdef ESP_PLATFORM
+    inline void _sio_late_ack() { _sio_ack(); };
+#else
+    void _sio_late_ack();
+#endif
+
+    /**
+     * @brief Send a non-acknowledgement (NAK) to the Atari 'N'
+     * This should be used if the command received by the SIO device is invalid, in the first place. It is not
+     * the same as sio_error().
+     */
+    void _sio_nak();
+
+    /**
+     * @brief Send a COMPLETE to the Atari 'C'
+     * This should be used after processing of the command to indicate that we've successfully finished. Failure to send
+     * either a COMPLETE or ERROR will result in a SIO TIMEOUT (138) to be reported in DSTATS.
+     */
+    void _sio_complete();
+
+    /**
+     * @brief Send an ERROR to the Atari 'E'
+     * This should be used during or after processing of the command to indicate that an error resulted
+     * from processing the command, and that the Atari should probably re-try the command. Failure to
+     * send an ERROR or COMPLTE will result in a SIO TIMEOUT (138) to be reported in DSTATS.
+     */
+    void _sio_error();
 
 public:
     void setup();
@@ -258,6 +247,7 @@ public:
     void changeDeviceId(virtualDevice *pDevice, int device_id);
 
     int getBaudrate();                                          // Gets current SIO baud rate setting
+    int getCurrentBaudrate();                                   // Gets current I/O channel baud rate
     void setBaudrate(int baud);                                 // Sets SIO to specific baud rate
     void toggleBaudrate();                                      // Toggle between standard and high speed SIO baud rate
 
@@ -293,6 +283,13 @@ public:
 #ifdef ESP_PLATFORM
     QueueHandle_t qSioMessages = nullptr;
 #endif
+
+    void transaction_accept(transState_t expectMoreData) override;
+    void transaction_success() override;
+    void transaction_error() override;
+    success_is_true transaction_get(void *data, size_t len) override;
+    using SystemBusBase::transaction_send;
+    void transaction_send(const void *data, size_t len, bool is_error=false) override;
 
     // Everybody thinks "oh I know how a serial port works, I'll just
     // access it directly and bypass the bus!" ಠ_ಠ
