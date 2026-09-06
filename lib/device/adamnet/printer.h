@@ -31,11 +31,11 @@ protected:
 
     void sio_write(uint8_t aux1, uint8_t aux2);
 
-    virtual void adamnet_control_status() override;
-    virtual void adamnet_control_send();
-    virtual void adamnet_control_ready() override;
+    void adamnet_control_send(const FujiAdamPacket &packet) override;
+    void adamnet_control_ready() override;
 
-    void adamnet_process(const FujiAdamPacket &packet) override;
+    AdamNetStatus deviceStatus() override;
+
     void shutdown() override;
 
     printer_emu *_pptr = nullptr;

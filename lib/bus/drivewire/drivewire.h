@@ -77,6 +77,7 @@ class drivewireNetStream; // declare here so can reference it, but define in net
 class drivewireCassette;  // Cassette forward-declaration.
 class drivewireCPM;       // CPM device.
 class drivewirePrinter;   // Printer device
+class drivewireDisk;      // See if you can guess what kind of device it is
 class fujiDevice;
 
 class drivewireDevice
@@ -146,9 +147,6 @@ private:
     const FujiDWPacket *_activeFrame;
     drivewireDevice *_activeDev = nullptr;
     drivewireModem *_modemDev = nullptr;
-    drivewireFuji *_fujiDev = nullptr;
-    //drivewireNetwork *_netDev[8] = {nullptr};
-    drivewireNetStream *_streamDev = nullptr;
     drivewireCassette *_cassetteDev = nullptr;
     drivewireCPM *_cpmDev = nullptr;
     drivewirePrinter *_printerdev = nullptr;
@@ -263,7 +261,7 @@ public:
     bool isDragon() { return bDragon; }
 
     // When true, op_readex()'s named-object fallback opens /DGNLOBBY.DWL
-    // instead of /AUTOLOAD.DWL. Set via FUJICMD_SET_BOOT_MODE mode 2 on Dragon.
+    // instead of /AUTOLOAD.DWL. Set via CMD::FUJI_SET_BOOT_MODE mode 2 on Dragon.
     bool useLobbyDwl = false;
 
     drivewireCassette *getCassette() { return _cassetteDev; }
@@ -313,7 +311,8 @@ public:
     }
 
     // For compatibility with fujiDevice.cpp
-    void changeDeviceId(void *pDevice, int device_id) {};
+    void rotateDevices(const std::vector<drivewireDisk *> &disks, int amount) {}
+    fujiDeviceID_t fujiIDForDevice(drivewireDisk *device);
 };
 
 extern systemBus SYSTEM_BUS;

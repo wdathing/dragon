@@ -140,13 +140,13 @@ if(DEFINED DEBUG_NO_REBOOT)
 endif()
 
 set(INCLUDE_DIRS include
-    lib/compat lib/config lib/utils lib/hardware lib/clock
+    lib/compat lib/config lib/utils lib/hardware lib/clipboard
     lib/FileSystem
-    lib/tcpip lib/ftp lib/TNFSlib lib/telnet lib/fnjson
+    lib/tcpip lib/ftp lib/TNFSlib lib/telnet lib/fnjson lib/fnsgml
     lib/webdav lib/http lib/sam lib/task
     lib/modem-sniffer lib/printer-emulator
     lib/network-protocol
-    lib/fuji lib/bus lib/device lib/device/fujiDevice lib/media
+    lib/fuji lib/bus lib/device lib/device/fujiDevice lib/device/fujiClock lib/media
     lib/encrypt lib/base64
     lib/devrelay/commands lib/devrelay/service lib/devrelay/slip lib/devrelay/types
     lib/encoding
@@ -156,10 +156,13 @@ set(INCLUDE_DIRS include
     components_pc/libsmb2/include
     components_pc/libssh/include
     components_pc/libnfs/include
+    components/gumbo
+    components/gumbo-query
 )
 
 set(SOURCES src/main.cpp
     lib/config/fnConfig.h lib/config/fnConfig.cpp
+    lib/config/fnPassword.h lib/config/fnPassword.cpp
     lib/config/fnc_bt.cpp
     lib/config/fnc_cassette.cpp
     lib/config/fnc_cpm.cpp
@@ -180,9 +183,11 @@ set(SOURCES src/main.cpp
     lib/config/fnc_util.cpp
     lib/config/fnc_wifi.cpp
     include/debug.h
-    lib/clock/Clock.h lib/clock/Clock.cpp
+    lib/device/fujiClock/fujiClock.h lib/device/fujiClock/fujiClock.cpp
+    lib/clipboard/clipboardManager.h lib/clipboard/clipboardManager.cpp
     lib/utils/utils.h lib/utils/utils.cpp
     lib/utils/cbuf.h lib/utils/cbuf.cpp
+    lib/utils/fn_time.h lib/utils/fn_time.cpp
     lib/utils/string_utils.h lib/utils/string_utils.cpp
     lib/utils/peoples_url_parser.h lib/utils/peoples_url_parser.cpp
     lib/utils/punycode.h lib/utils/punycode.cpp
@@ -222,13 +227,22 @@ set(SOURCES src/main.cpp
     lib/TNFSlib/tnfslib_udp.h lib/TNFSlib/tnfslib_udp_testing.cpp
     lib/telnet/libtelnet.h lib/telnet/libtelnet.c
     lib/fnjson/fnjson.h lib/fnjson/fnjson.cpp
+    lib/fnsgml/fnsgml.h lib/fnsgml/fnsgml.cpp
+    components/gumbo-query/Document.cpp components/gumbo-query/Node.cpp components/gumbo-query/Object.cpp
+    components/gumbo-query/Parser.cpp components/gumbo-query/QueryUtil.cpp components/gumbo-query/Selection.cpp
+    components/gumbo-query/Selector.cpp
     components_pc/mongoose/mongoose.h components_pc/mongoose/mongoose.c
     lib/webdav/WebDAV.h lib/webdav/WebDAV.cpp
     lib/webdav/IndexParser.h lib/webdav/IndexParser.cpp
     lib/http/httpService.h lib/http/mgHttpService.cpp
+    lib/http/google_scopes.h
     lib/http/httpServiceParser.h lib/http/httpServiceParser.cpp
     lib/http/httpServiceConfigurator.h lib/http/httpServiceConfigurator.cpp
-    lib/http/httpServiceBrowser.h lib/http/httpServiceBrowser.cpp
+    lib/http/appKeyManager.h lib/http/appKeyManager.cpp
+    lib/http/fileManager.h lib/http/fileManager.cpp
+    lib/http/fnSession.h lib/http/fnSession.cpp
+    lib/http/httpServiceBrowse.h lib/http/httpServiceBrowse.cpp
+    lib/http/httpServiceApi.h lib/http/httpServiceApi.cpp
     lib/http/mgHttpClient.h lib/http/mgHttpClient.cpp
     lib/task/fnTask.h lib/task/fnTask.cpp
     lib/task/fnTaskManager.h lib/task/fnTaskManager.cpp
@@ -250,16 +264,22 @@ set(SOURCES src/main.cpp
     lib/printer-emulator/png_printer.h lib/printer-emulator/png_printer.cpp
     lib/printer-emulator/printer_emulator.h lib/printer-emulator/printer_emulator.cpp
     lib/printer-emulator/svg_plotter.h lib/printer-emulator/svg_plotter.cpp
-    lib/network-protocol/NetworkProtocolFactory.h
+    lib/network-protocol/NetworkProtocolFactory.h lib/network-protocol/NetworkProtocolFactory.cpp
     lib/network-protocol/network_data.h
     lib/network-protocol/networkStatus.h lib/network-protocol/status_error_codes.h
     lib/network-protocol/Protocol.h lib/network-protocol/Protocol.cpp
-    lib/network-protocol/ProtocolParser.h lib/network-protocol/ProtocolParser.cpp
+    lib/network-protocol/CLIPBOARD.h lib/network-protocol/CLIPBOARD.cpp
     lib/network-protocol/CPM.h lib/network-protocol/CPM.cpp
     lib/network-protocol/GDRIVE.h lib/network-protocol/GDRIVE.cpp
     lib/network-protocol/ONEDRIVE.h lib/network-protocol/ONEDRIVE.cpp
+    lib/network-protocol/text_format.h
     lib/network-protocol/Mailbox.h lib/network-protocol/Mailbox.cpp
+    lib/network-protocol/mail_draft.h lib/network-protocol/mail_draft.cpp
     lib/network-protocol/GMAIL.h lib/network-protocol/GMAIL.cpp
+    lib/network-protocol/Calendar.h lib/network-protocol/Calendar.cpp
+    lib/network-protocol/calendar_draft.h lib/network-protocol/calendar_draft.cpp
+    lib/network-protocol/GCAL.h lib/network-protocol/GCAL.cpp
+    lib/network-protocol/ICAL.h lib/network-protocol/ICAL.cpp
     lib/network-protocol/IMAPS.h lib/network-protocol/IMAPS.cpp
     lib/network-protocol/Test.h lib/network-protocol/Test.cpp
     lib/network-protocol/TCP.h lib/network-protocol/TCP.cpp
@@ -283,6 +303,7 @@ set(SOURCES src/main.cpp
     lib/fuji/fujiHost.h lib/fuji/fujiHost.cpp
     lib/fuji/fujiDisk.h lib/fuji/fujiDisk.cpp
     lib/bus/bus.h lib/bus/bus.cpp
+    lib/bus/DaisyChain.h lib/bus/DaisyChain.cpp
     lib/device/device.h
     lib/device/disk.h
     lib/device/printer.h
@@ -293,6 +314,7 @@ set(SOURCES src/main.cpp
     lib/device/fujiDevice/Base64Mixin.h lib/device/fujiDevice/Base64Mixin.cpp
     lib/device/fujiDevice/HashMixin.h lib/device/fujiDevice/HashMixin.cpp
     lib/device/fujiDevice/QRMixin.h lib/device/fujiDevice/QRMixin.cpp
+    lib/device/fujiDevice/AppKeyMixin.h lib/device/fujiDevice/AppKeyMixin.cpp
     lib/device/network.h
     lib/device/netstream.h
     lib/device/siocpm.h
@@ -326,7 +348,7 @@ if(FUJINET_TARGET STREQUAL "ATARI")
     lib/device/sio/network.h lib/device/sio/network.cpp
     lib/device/sio/netstream.h lib/device/sio/netstream.cpp
     lib/device/sio/voice.h lib/device/sio/voice.cpp
-    lib/device/sio/clock.h lib/device/sio/clock.cpp
+    lib/device/sio/sioClock.h lib/device/sio/sioClock.cpp
     lib/device/sio/siocpm.h lib/device/sio/siocpm.cpp
     lib/device/sio/pclink.h lib/device/sio/pclink.cpp
     lib/device/sio/modem.h lib/device/sio/modem.cpp
@@ -353,6 +375,7 @@ if(FUJINET_TARGET STREQUAL "APPLE")
     lib/bus/iwm/connector.h
     lib/bus/iwm/iwm.h lib/bus/iwm/iwm.cpp
     lib/bus/iwm/FujiIWMPacket.h lib/bus/iwm/FujiIWMPacket.cpp
+    lib/bus/iwm/IWMBusIDMap.h lib/bus/iwm/IWMBusIDMap.cpp
 
     lib/devrelay/util.h lib/devrelay/util.cpp
     lib/devrelay/types/Request.h lib/devrelay/types/Request.cpp
@@ -385,7 +408,7 @@ if(FUJINET_TARGET STREQUAL "APPLE")
     lib/device/iwm/modem.h lib/device/iwm/modem.cpp
     lib/device/iwm/iwmFuji.h lib/device/iwm/iwmFuji.cpp
     lib/device/iwm/network.h lib/device/iwm/network.cpp
-    lib/device/iwm/clock.h lib/device/iwm/clock.cpp
+    lib/device/iwm/iwmClock.h lib/device/iwm/iwmClock.cpp
     lib/device/iwm/cpm.h lib/device/iwm/cpm.cpp
 
     )
@@ -416,13 +439,18 @@ if(FUJINET_TARGET STREQUAL "COCO")
     lib/media/drivewire/mediaTypeMRM.h lib/media/drivewire/mediaTypeMRM.cpp
     lib/media/drivewire/mediaTypeVDK.h lib/media/drivewire/mediaTypeVDK.cpp
     lib/media/drivewire/mediaTypeROM.h lib/media/drivewire/mediaTypeROM.cpp
+    lib/media/drivewire/mediaTypeCASDSK.h lib/media/drivewire/mediaTypeCASDSK.cpp
+    lib/media/drivewire/casSource.h lib/media/drivewire/casSourceFile.h
+    lib/media/drivewire/casReader.h lib/media/drivewire/casReader.cpp
+    lib/media/drivewire/casIndex.h lib/media/drivewire/casIndex.cpp
+    lib/media/drivewire/decbLayout.h lib/media/drivewire/decbLayout.cpp
 
     lib/device/drivewire/drivewireFuji.h lib/device/drivewire/drivewireFuji.cpp
     lib/device/drivewire/network.h lib/device/drivewire/network.cpp
     lib/device/drivewire/disk.h lib/device/drivewire/disk.cpp
     lib/device/drivewire/printer.h lib/device/drivewire/printer.cpp
     lib/device/drivewire/printerlist.h lib/device/drivewire/printerlist.cpp
-    lib/device/drivewire/clock.h lib/device/drivewire/clock.cpp
+    lib/device/drivewire/drivewireClock.h lib/device/drivewire/drivewireClock.cpp
 
     )
 endif()
@@ -439,6 +467,7 @@ if(FUJINET_TARGET STREQUAL "ADAM")
     lib/printer-emulator/coleco_printer.h lib/printer-emulator/coleco_printer.cpp
 
     lib/bus/adamnet/adamnet.h lib/bus/adamnet/adamnet.cpp
+    lib/bus/adamnet/AdamNetPhase.h lib/bus/adamnet/AdamNetPhase.cpp
     lib/bus/adamnet/FujiAdamPacket.h lib/bus/adamnet/FujiAdamPacket.cpp
     lib/hardware/BoIPChannel.h lib/hardware/BoIPChannel.cpp
 
@@ -448,13 +477,12 @@ if(FUJINET_TARGET STREQUAL "ADAM")
     lib/media/adam/mediaTypeROM.h lib/media/adam/mediaTypeROM.cpp
 
     lib/device/adamnet/adamFuji.h lib/device/adamnet/adamFuji.cpp
+    lib/device/adamnet/adamClock.h lib/device/adamnet/adamClock.cpp
     lib/device/adamnet/disk.h lib/device/adamnet/disk.cpp
     lib/device/adamnet/keyboard.h lib/device/adamnet/keyboard.cpp
-    lib/device/adamnet/modem.h lib/device/adamnet/modem.cpp
     lib/device/adamnet/network.h lib/device/adamnet/network.cpp
     lib/device/adamnet/printer.h lib/device/adamnet/printer.cpp
     lib/device/adamnet/printerlist.h lib/device/adamnet/printerlist.cpp
-    lib/device/adamnet/query_device.h lib/device/adamnet/query_device.cpp
     lib/device/adamnet/serial.h lib/device/adamnet/serial.cpp
 
     )
@@ -469,8 +497,9 @@ if(FUJINET_TARGET STREQUAL "RS232")
 
     lib/media/rs232/diskType.h lib/media/rs232/diskType.cpp
     lib/media/rs232/diskTypeImg.h lib/media/rs232/diskTypeImg.cpp
+    lib/media/rs232/diskTypeROM.h lib/media/rs232/diskTypeROM.cpp
 
-    lib/device/rs232/apetime.cpp lib/device/rs232/apetime.h
+    lib/device/rs232/rs232Clock.cpp lib/device/rs232/rs232Clock.h
     lib/device/rs232/disk.cpp lib/device/rs232/disk.h
     lib/device/rs232/modem.cpp lib/device/rs232/modem.h
     lib/device/rs232/network.cpp lib/device/rs232/network.h
@@ -479,6 +508,34 @@ if(FUJINET_TARGET STREQUAL "RS232")
     lib/device/rs232/rs232Fuji.cpp lib/device/rs232/rs232Fuji.h
     lib/device/rs232/rs232cpm.cpp lib/device/rs232/rs232cpm.h
 
+    )
+endif()
+
+if(FUJINET_TARGET STREQUAL "LYNX")
+    # ComLynx headers use bare names, so add their directories after the
+    # platform-dispatch directories used by the common source list.
+    list(APPEND INCLUDE_DIRS lib/bus/comlynx lib/device/comlynx lib/media/lynx components/lz4/lib)
+
+    list(APPEND SOURCES
+
+    lib/bus/comlynx/comlynx.h lib/bus/comlynx/comlynx.cpp
+    lib/bus/comlynx/FujiLynxPacket.h lib/bus/comlynx/FujiLynxPacket.cpp
+    lib/hardware/BoIPChannel.h lib/hardware/BoIPChannel.cpp
+
+    lib/media/lynx/mediaType.h lib/media/lynx/mediaType.cpp
+    lib/media/lynx/mediaTypeROM.h lib/media/lynx/mediaTypeROM.cpp
+
+    lib/device/comlynx/disk.cpp lib/device/comlynx/disk.h
+    lib/device/comlynx/lynxFuji.cpp lib/device/comlynx/lynxFuji.h
+    lib/device/comlynx/netstream.cpp lib/device/comlynx/netstream.h
+    lib/device/comlynx/network.cpp lib/device/comlynx/network.h
+    lib/device/comlynx/printer.cpp lib/device/comlynx/printer.h
+    lib/device/comlynx/printerlist.cpp lib/device/comlynx/printerlist.h
+    lib/device/comlynx/redeye.cpp lib/device/comlynx/redeye.h
+
+    lib/printer-emulator/coleco_printer.h lib/printer-emulator/coleco_printer.cpp
+
+    components/lz4/lib/lz4.h components/lz4/lib/lz4.c
     )
 endif()
 
@@ -515,26 +572,161 @@ option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 
 # Mbed TLS
 # https://github.com/Mbed-TLS/mbedtls
-# - to build from source (failed on Windows/MSYS2)
-# add_subdirectory(components_pc/mbedtls)
-# - to use library package (Ubuntu deb package is old, does not support cmake/find_package)
-# find_package(MbedTLS)
-# - try to find necessary files in system ...
-set(_MBEDTLS_ROOT_HINTS $ENV{MBEDTLS_ROOT_DIR} ${MBEDTLS_ROOT_DIR})
-set(_MBEDTLS_ROOT_PATHS "$ENV{PROGRAMFILES}/libmbedtls")
-set(_MBEDTLS_ROOT_HINTS_AND_PATHS HINTS ${_MBEDTLS_ROOT_HINTS} PATHS ${_MBEDTLS_ROOT_PATHS})
-find_library(MBEDTLS_STATIC_LIB libmbedtls.a HINTS ${_MBEDTLS_ROOT_HINTS_AND_PATHS})
-find_library(MBEDX509_STATIC_LIB libmbedx509.a HINTS ${_MBEDTLS_ROOT_HINTS_AND_PATHS})
-find_library(MBEDCRYPTO_STATIC_LIB libmbedcrypto.a HINTS ${_MBEDTLS_ROOT_HINTS_AND_PATHS})
-find_path(MBEDTLS_INCLUDE_DIR mbedtls/ssl.h HINTS ${_MBEDTLS_ROOT_HINTS_AND_PATHS} PATH_SUFFIXES include)
+# Prefer 3.x and accept 2.x, but reject 4.x: it removed the low-level headers (entropy.h,
+# ctr_drbg.h, sha256.h, ...) that mongoose's MG_TLS=1 backend needs, split crypto out into
+# TF-PSA-Crypto that CRYPTO_LIBS below does not model, and is not a CI-tested configuration.
+
+# 3.x/4.x keep the version macros in build_info.h, 2.x in version.h.
+function(_fn_mbedtls_version _inc _out_major _out_ver)
+    set(_ver "")
+    foreach(_hdr build_info.h version.h)
+        if(NOT _ver AND EXISTS "${_inc}/mbedtls/${_hdr}")
+            file(STRINGS "${_inc}/mbedtls/${_hdr}" _lines
+                 REGEX "^[ \t]*#[ \t]*define[ \t]+MBEDTLS_VERSION_STRING[ \t]+\"[0-9]")
+            if(_lines)
+                list(GET _lines 0 _line)
+                string(REGEX REPLACE "^[^\"]*\"([0-9.]+)\".*$" "\\1" _ver "${_line}")
+            endif()
+        endif()
+    endforeach()
+    string(REGEX MATCH "^[0-9]+" _major "${_ver}")
+    set(${_out_major} "${_major}" PARENT_SCOPE)
+    set(${_out_ver} "${_ver}" PARENT_SCOPE)
+endfunction()
+
+# Candidate "include|lib" pairs, most preferred first. Pairs rather than one root because
+# distros ship the side-by-side 3.x with split prefixes (Arch: /usr/include/mbedtls3 + /usr/lib/mbedtls3).
+set(_MBEDTLS_CANDIDATES "")
+if(MBEDTLS_INCLUDE_DIR AND MBEDTLS_LIBRARY_DIR)
+    list(APPEND _MBEDTLS_CANDIDATES "${MBEDTLS_INCLUDE_DIR}|${MBEDTLS_LIBRARY_DIR}")
+endif()
+foreach(_root ${MBEDTLS_ROOT_DIR} $ENV{MBEDTLS_ROOT_DIR})
+    if(_root)
+        list(APPEND _MBEDTLS_CANDIDATES "${_root}/include|${_root}/lib" "${_root}|${_root}")
+    endif()
+endforeach()
+
+# An explicit override is authoritative - do not silently fall through to another install.
+set(_MBEDTLS_EXPLICIT "${_MBEDTLS_CANDIDATES}")
+
+if(DEFINED ENV{PROGRAMFILES})
+    list(APPEND _MBEDTLS_CANDIDATES "$ENV{PROGRAMFILES}/libmbedtls/include|$ENV{PROGRAMFILES}/libmbedtls/lib")
+endif()
+foreach(_prefix /usr /usr/local)
+    list(APPEND _MBEDTLS_CANDIDATES "${_prefix}/include/mbedtls3|${_prefix}/lib/mbedtls3")
+    if(CMAKE_LIBRARY_ARCHITECTURE)
+        list(APPEND _MBEDTLS_CANDIDATES
+             "${_prefix}/include/mbedtls3|${_prefix}/lib/${CMAKE_LIBRARY_ARCHITECTURE}/mbedtls3")
+    endif()
+endforeach()
+foreach(_brew $ENV{HOMEBREW_PREFIX} /opt/homebrew /usr/local)
+    if(_brew)
+        list(APPEND _MBEDTLS_CANDIDATES "${_brew}/opt/mbedtls@3/include|${_brew}/opt/mbedtls@3/lib")
+    endif()
+endforeach()
+
+if(_MBEDTLS_EXPLICIT)
+    set(_MBEDTLS_CANDIDATES "${_MBEDTLS_EXPLICIT}")
+endif()
+
+# Probe into plain variables so a warm build/ cache cannot pin a previously found version.
+set(_MBEDTLS_MAJOR "")
+set(_MBEDTLS_VER "")
+set(_MBEDTLS_INC "")
+set(_MBEDTLS_LIB "")
+set(_MBEDTLS_NOTE "")
+foreach(_cand ${_MBEDTLS_CANDIDATES})
+    string(REPLACE "|" ";" _pair "${_cand}")
+    list(GET _pair 0 _inc)
+    list(GET _pair 1 _lib)
+    if(EXISTS "${_inc}/mbedtls/ssl.h" AND EXISTS "${_lib}/libmbedtls.a")
+        _fn_mbedtls_version("${_inc}" _major _ver)
+        if(_major STREQUAL "3")
+            set(_MBEDTLS_MAJOR 3)
+            set(_MBEDTLS_VER "${_ver}")
+            set(_MBEDTLS_INC "${_inc}")
+            set(_MBEDTLS_LIB "${_lib}")
+            break()
+        elseif(_major STREQUAL "2" AND NOT _MBEDTLS_MAJOR)
+            set(_MBEDTLS_MAJOR 2)   # usable, but keep looking for a 3.x
+            set(_MBEDTLS_VER "${_ver}")
+            set(_MBEDTLS_INC "${_inc}")
+            set(_MBEDTLS_LIB "${_lib}")
+        elseif(_major AND NOT _MBEDTLS_REJECTED)
+            set(_MBEDTLS_REJECTED "${_ver}")   # remembered only to report it accurately
+            set(_MBEDTLS_REJECTED_INC "${_inc}")
+        endif()
+    endif()
+endforeach()
+
+# No side-by-side package matched: fall back to the default system search paths.
+if(NOT _MBEDTLS_MAJOR AND NOT _MBEDTLS_EXPLICIT)
+    find_path(_MBEDTLS_SYS_INC mbedtls/ssl.h PATH_SUFFIXES include)
+    find_library(_MBEDTLS_SYS_LIB libmbedtls.a)
+    if(_MBEDTLS_SYS_INC AND _MBEDTLS_SYS_LIB)
+        _fn_mbedtls_version("${_MBEDTLS_SYS_INC}" _MBEDTLS_MAJOR _MBEDTLS_VER)
+        set(_MBEDTLS_INC "${_MBEDTLS_SYS_INC}")
+        get_filename_component(_MBEDTLS_LIB "${_MBEDTLS_SYS_LIB}" PATH)
+    endif()
+endif()
+
+# Nothing usable, but we saw an unsupported version - report that instead of "not found".
+if(NOT _MBEDTLS_MAJOR AND _MBEDTLS_REJECTED)
+    set(_MBEDTLS_VER "${_MBEDTLS_REJECTED}")
+    string(REGEX MATCH "^[0-9]+" _MBEDTLS_MAJOR "${_MBEDTLS_REJECTED}")
+    set(_MBEDTLS_INC "${_MBEDTLS_REJECTED_INC}")
+endif()
+
+if(NOT _MBEDTLS_MAJOR)
+    message(FATAL_ERROR
+        "Mbed TLS not found. Install the 3.x development package:\n"
+        "    Arch:   pacman -S mbedtls3\n"
+        "    Debian: apt install libmbedtls-dev\n"
+        "    macOS:  brew install mbedtls@3\n"
+        "  or point the build at it with -DMBEDTLS_ROOT_DIR=<prefix>")
+elseif(_MBEDTLS_MAJOR GREATER 3)
+    message(FATAL_ERROR
+        "Found unsupported Mbed TLS ${_MBEDTLS_VER} in ${_MBEDTLS_INC}.\n"
+        "  4.x removed the headers mongoose (MG_TLS=1) needs and split crypto into TF-PSA-Crypto.\n"
+        "  Install 3.x alongside it - it is then picked up automatically:\n"
+        "    Arch:   pacman -S mbedtls3\n"
+        "    macOS:  brew install mbedtls@3\n"
+        "  or point the build at a 3.x prefix with -DMBEDTLS_ROOT_DIR=<prefix>")
+elseif(_MBEDTLS_MAJOR EQUAL 2)
+    # Usable, so note it in the summary below rather than warning on every configure.
+    set(_MBEDTLS_NOTE " (3.x is preferred)")
+endif()
+
+foreach(_l mbedx509 mbedcrypto)
+    if(NOT EXISTS "${_MBEDTLS_LIB}/lib${_l}.a")
+        message(FATAL_ERROR "Mbed TLS in ${_MBEDTLS_LIB} is missing lib${_l}.a")
+    endif()
+endforeach()
+
+set(MBEDTLS_VERSION "${_MBEDTLS_VER}" CACHE INTERNAL "Detected Mbed TLS version" FORCE)
+set(MBEDTLS_VERSION_MAJOR "${_MBEDTLS_MAJOR}" CACHE INTERNAL "Detected Mbed TLS major version" FORCE)
+# Plain variables, not cache: publishing these would look like a user override on the next
+# configure and would pin the build to whatever was found first.
+set(MBEDTLS_INCLUDE_DIR "${_MBEDTLS_INC}")
+set(MBEDTLS_LIBRARY_DIR "${_MBEDTLS_LIB}")
+set(MBEDTLS_STATIC_LIB    "${_MBEDTLS_LIB}/libmbedtls.a"    CACHE FILEPATH "Mbed TLS libmbedtls.a" FORCE)
+set(MBEDX509_STATIC_LIB   "${_MBEDTLS_LIB}/libmbedx509.a"   CACHE FILEPATH "Mbed TLS libmbedx509.a" FORCE)
+set(MBEDCRYPTO_STATIC_LIB "${_MBEDTLS_LIB}/libmbedcrypto.a" CACHE FILEPATH "Mbed TLS libmbedcrypto.a" FORCE)
 
 set(CRYPTO_LIBS ${MBEDTLS_STATIC_LIB} ${MBEDX509_STATIC_LIB} ${MBEDCRYPTO_STATIC_LIB})
+# Empty stubs in distro packages, but real code in a source build with Everest/p256-m enabled.
+foreach(_extra libeverest.a libp256m.a)
+    if(EXISTS "${_MBEDTLS_LIB}/${_extra}")
+        list(APPEND CRYPTO_LIBS "${_MBEDTLS_LIB}/${_extra}")
+    endif()
+endforeach()
 
 message("***************** Mbed TLS *****************")
+message("MBEDTLS_VERSION=${MBEDTLS_VERSION}${_MBEDTLS_NOTE}")
+message("MBEDTLS_INCLUDE_DIR=${MBEDTLS_INCLUDE_DIR}")
 message("MBEDTLS_STATIC_LIB=${MBEDTLS_STATIC_LIB}")
 message("MBEDX509_STATIC_LIB=${MBEDX509_STATIC_LIB}")
 message("MBEDCRYPTO_STATIC_LIB=${MBEDCRYPTO_STATIC_LIB}")
-message("MBEDTLS_INCLUDE_DIR=${MBEDTLS_INCLUDE_DIR}")
 message("********************************************")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -581,7 +773,13 @@ add_subdirectory(components_pc/libssh)
 # https://github.com/sahlberg/libnfs
 add_subdirectory(components_pc/libnfs)
 
-target_link_libraries(fujinet pthread expat cjson cjson_utils smb2 ssh nfs)
+# Gumbo (pure-C HTML5 parser) backing components/gumbo-query (CSS selectors) for FNSGML.
+file(GLOB GUMBO_SOURCES ${CMAKE_SOURCE_DIR}/components/gumbo/*.c)
+add_library(gumbo_fn STATIC ${GUMBO_SOURCES})
+target_include_directories(gumbo_fn PUBLIC ${CMAKE_SOURCE_DIR}/components/gumbo)
+target_compile_options(gumbo_fn PRIVATE -w) # vendored third-party; suppress its warnings
+
+target_link_libraries(fujinet pthread expat cjson cjson_utils smb2 ssh nfs gumbo_fn)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(fujinet ws2_32 bcrypt)
@@ -589,32 +787,45 @@ endif()
 
 # Version file
 # run build_version_pc.py to generate ${CMAKE_BINARY_DIR}/include/build_version.h
-add_custom_command(
-  OUTPUT  "${CMAKE_BINARY_DIR}/include/build_version.h"
-  DEPENDS build_version_pc.py "${CMAKE_SOURCE_DIR}/include/version.h"
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/include"
-  COMMAND python build_version_pc.py "${CMAKE_SOURCE_DIR}/include/version.h" "${CMAKE_BINARY_DIR}/include/build_version.h"
-  COMMENT "Create build_version.h file"
-  VERBATIM
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
+add_custom_target(build_version
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMAND python build_version_pc.py "${CMAKE_SOURCE_DIR}/include/version.h" "${CMAKE_BINARY_DIR}/include/build_version.h"
+    BYPRODUCTS "${CMAKE_BINARY_DIR}/include/build_version.h"
+    COMMENT "Create build_version.h file"
+    VERBATIM
 )
-add_custom_target(build_version DEPENDS "${CMAKE_BINARY_DIR}/include/build_version.h")
 add_dependencies(fujinet build_version)
 target_include_directories(fujinet PRIVATE "${CMAKE_BINARY_DIR}/include")
 
 # WebUI
 # "build_webui" target
+# Everything build_webui.py reads
+file(GLOB_RECURSE WEBUI_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/data/webui/common/*"
+    "${CMAKE_SOURCE_DIR}/data/webui/template/*"
+    "${CMAKE_SOURCE_DIR}/data/webui/device_specific/${FUJINET_BUILD_PLATFORM}/*"
+)
+# Stamp, not BUILD_DATA_DIR, as OUTPUT: editing a file does not change its
+# directory's timestamp, and the script wipes BUILD_DATA_DIR on every run.
+set(WEBUI_STAMP "${CMAKE_BINARY_DIR}/build_webui.stamp")
 add_custom_command(
-    OUTPUT "${BUILD_DATA_DIR}"
+    OUTPUT "${WEBUI_STAMP}"
     DEPENDS build_webui.py
+      "${CMAKE_SOURCE_DIR}/data/webui/config/${FUJINET_BUILD_BOARD}.yaml"
+      ${WEBUI_SOURCES}
+      # Touched by each re-configure, so a deleted file also triggers a rebuild
+      "${CMAKE_BINARY_DIR}/CMakeFiles/cmake.verify_globs"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMAND ${CMAKE_COMMAND} -E env
       FUJINET_BUILD_BOARD=${FUJINET_BUILD_BOARD}
       FUJINET_BUILD_PLATFORM=${FUJINET_BUILD_PLATFORM}
       BUILD_DATA_DIR=${BUILD_DATA_DIR}
       python3 build_webui.py
+    COMMAND ${CMAKE_COMMAND} -E touch "${WEBUI_STAMP}"
+    COMMENT "Generating web UI"
 )
-add_custom_target(build_webui DEPENDS "${BUILD_DATA_DIR}")
+add_custom_target(build_webui DEPENDS "${WEBUI_STAMP}")
 
 # "dist" target
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -649,6 +860,9 @@ set_property(
 # include data cleanup in "clean" target
 set_property(
     DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES ${BUILD_DATA_DIR}
+)
+set_property(
+    DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${WEBUI_STAMP}"
 )
 set_property(
     DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${CMAKE_BINARY_DIR}/include"

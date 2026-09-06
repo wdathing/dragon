@@ -12,6 +12,7 @@
 
 #include "fnSystem.h"
 #include "fnConfig.h"
+#include "fnWiFi.h"
 #include "fnDNS.h"
 #include "led.h"
 #include "utils.h"
@@ -22,6 +23,12 @@
 #else /* !ESP_PLATFORM */
 #define SERIAL_DEVICE Config.get_serial_port()
 #endif /* ESP_PLATFORM */
+
+#if FUJINET_OVER_USB
+// run USB just above the WiFi task (prio 23) until association, per drivewire.cpp
+#define RS232_USB_BOOT_PRIORITY 24
+#define RS232_USB_RUN_PRIORITY  20
+#endif
 
 // Helper functions outside the class defintions
 
@@ -46,13 +53,13 @@ void systemBus::transaction_accept(transState_t expectMoreData)
 void systemBus::transaction_success()
 {
     assert(_transaction_state == TRANS_STATE::NO_GET || _transaction_state == TRANS_STATE::DID_GET);
-    sendReplyPacket(_activeDev->_devnum, true, nullptr, 0);
+    sendReplyPacket(_activeDev->id(), true, nullptr, 0);
     _transaction_state = TRANS_STATE::INVALID;
 }
 
 void systemBus::transaction_error()
 {
-    sendReplyPacket(_activeDev->_devnum, false, nullptr, 0);
+    sendReplyPacket(_activeDev->id(), false, nullptr, 0);
     _transaction_state = TRANS_STATE::INVALID;
 }
 
@@ -80,7 +87,7 @@ success_is_true systemBus::transaction_get(void *data, size_t len)
 void systemBus::transaction_send(const void *data, size_t len, bool is_error)
 {
     assert(_transaction_state == TRANS_STATE::NO_GET);
-    sendReplyPacket(_activeDev->_devnum, !is_error, data, len);
+    sendReplyPacket(_activeDev->id(), !is_error, data, len);
     _transaction_state = TRANS_STATE::INVALID;
 }
 
@@ -88,14 +95,6 @@ void systemBus::transaction_send(const void *data, size_t len, bool is_error)
 void systemBus::_rs232_process_cmd()
 {
     Debug_printf("rs232_process_cmd()\n");
-#ifdef OBSOLETE
-    if (_modemDev != nullptr && _modemDev->modemActive && Config.get_modem_enabled())
-    {
-        _modemDev->modemActive = false;
-        Debug_println("Modem was active - resetting RS232 baud");
-        _serial.setBaudrate(_rs232Baud);
-    }
-#endif /* OBSOLETE */
 
     ByteBuffer packet;
     int val, count;
@@ -123,33 +122,12 @@ void systemBus::_rs232_process_cmd()
     fnLedManager.set(eLed::LED_BUS, true);
 
     Debug_printf("\nCF: dev:%02x cmd:%02x dlen:%d\n",
-                 tempFrame->device(), tempFrame->command(),
+                 (uint8_t) tempFrame->device(), (uint8_t) tempFrame->command(),
                  tempFrame->data() ? tempFrame->data()->size() : -1);
 
 
     _activePacket = tempFrame.get();
-    _activeDev = nullptr;
-
-    if (tempFrame->device() == FUJI_DEVICEID_DISK && _fujiDev != nullptr
-        && _fujiDev->boot_config)
-    {
-        _activeDev = &_fujiDev->bootdisk;
-        Debug_println("FujiNet CONFIG boot");
-    }
-    else
-    {
-        // find device, ack and pass control
-        // or go back to WAIT
-        for (auto devicep : _daisyChain)
-        {
-            if (tempFrame->device() == devicep->_devnum)
-            {
-                _activeDev = devicep;
-                break;
-            }
-        }
-    }
-
+    _activeDev = _daisyChain.deviceWithFujiID(tempFrame->device());
     if (_activeDev != nullptr)
         _activeDev->rs232_process(*tempFrame);
 
@@ -166,6 +144,15 @@ void systemBus::_rs232_process_cmd()
  */
 void systemBus::service()
 {
+#if FUJINET_OVER_USB
+    // one-shot: drop USB back to normal priority once WiFi is up
+    if (_usb_boot_priority && fnWiFi.connected())
+    {
+        _serial.setServicePriority(RS232_USB_RUN_PRIORITY);
+        _usb_boot_priority = false;
+    }
+#endif
+
     // Check for any messages in our queue (this should always happen, even if any other special
     // modes disrupt normal RS232 handling - should probably make a separate task for this)
     /*_rs232_process_queue();*/
@@ -197,6 +184,10 @@ void systemBus::service()
 // Setup RS232 bus
 void systemBus::setup()
 {
+    // shutdown() latches this true; left set across an in-process restart,
+    // TNFS's poll loop bails out on its first check and fakes success.
+    shuttingDown = false;
+
     Debug_printf("RS232 SETUP: Baud rate: %u\n",Config.get_serial_baud());
 
     // Set up UART
@@ -224,6 +215,12 @@ void systemBus::setup()
     }
 
 #else /* FUJINET_OVER_USB */
+#ifdef PINMAP_FUJIVERSAL_INTV
+    // VID-only: any Minty build (PID varies with MSC), still rejects BOOTSEL
+    _serial.setExpectedDevice(0xCafe, 0);
+#endif
+    _serial.setServicePriority(RS232_USB_BOOT_PRIORITY);
+    _usb_boot_priority = true;
     _serial.begin();
     _port = &_serial;
 #endif /* FUJINET_OVER_USB */
@@ -235,71 +232,32 @@ void systemBus::setup()
 // Add device to RS232 bus
 void systemBus::addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id)
 {
-    if (device_id == FUJI_DEVICEID_FUJINET)
+    if (device_id == FUJI_DEVICEID::FUJINET)
     {
         _fujiDev = dynamic_cast<rs232Fuji *>(pDevice);
     }
-    else if (device_id == FUJI_DEVICEID_SERIAL)
+    else if (device_id == FUJI_DEVICEID::SERIAL)
     {
         _modemDev = (rs232Modem *)pDevice;
     }
-    else if (device_id >= FUJI_DEVICEID_NETWORK && device_id <= FUJI_DEVICEID_NETWORK_LAST)
+    else if (device_id >= FUJI_DEVICEID::NETWORK && device_id <= FUJI_DEVICEID::NETWORK_LAST)
     {
-        _netDev[device_id - FUJI_DEVICEID_NETWORK] = (rs232Network *)pDevice;
+        _netDev[device_id - FUJI_DEVICEID::NETWORK] = (rs232Network *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_MIDI)
+    else if (device_id == FUJI_DEVICEID::MIDI)
     {
         _streamDev = (rs232NetStream *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_CPM)
+    else if (device_id == FUJI_DEVICEID::CPM)
     {
         _cpmDev = (rs232CPM *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_PRINTER)
+    else if (device_id == FUJI_DEVICEID::PRINTER)
     {
         _printerdev = (rs232Printer *)pDevice;
     }
 
-    pDevice->_devnum = device_id;
-
-    _daisyChain.push_front(pDevice);
-}
-
-// Removes device from the RS232 bus.
-// Note that the destructor is called on the device!
-void systemBus::remDevice(virtualDevice *p)
-{
-    _daisyChain.remove(p);
-}
-
-// Should avoid using this as it requires counting through the list
-int systemBus::numDevices()
-{
-    int i = 0;
-    __BEGIN_IGNORE_UNUSEDVARS
-    for (auto devicep : _daisyChain)
-        i++;
-    return i;
-    __END_IGNORE_UNUSEDVARS
-}
-
-void systemBus::changeDeviceId(virtualDevice *p, int device_id)
-{
-    for (auto devicep : _daisyChain)
-    {
-        if (devicep == p)
-            devicep->_devnum = (fujiDeviceID_t) device_id;
-    }
-}
-
-virtualDevice *systemBus::deviceById(fujiDeviceID_t device_id)
-{
-    for (auto devicep : _daisyChain)
-    {
-        if (devicep->_devnum == device_id)
-            return devicep;
-    }
-    return nullptr;
+    _daisyChain.addDevice(pDevice, device_id);
 }
 
 // Give devices an opportunity to clean up before a reboot
@@ -309,7 +267,7 @@ void systemBus::shutdown()
 
     for (auto devicep : _daisyChain)
     {
-        Debug_printf("Shutting down device %02x\n",devicep->id());
+        Debug_printf("Shutting down device %02x\n", (uint8_t) devicep->id());
         devicep->shutdown();
     }
     Debug_printf("All devices shut down.\n");
@@ -378,7 +336,7 @@ void systemBus::writeBusPacket(FujiBusPacket &packet)
 void systemBus::sendReplyPacket(fujiDeviceID_t source, bool ack, const void *data, size_t length)
 {
     // FIXME - check to make sure this wasn't through a bus call
-    if (source == _modemDev->_devnum)
+    if (source == _modemDev->id())
     {
         _port->write(data, length);
         return;
@@ -392,9 +350,14 @@ void systemBus::sendReplyPacket(fujiDeviceID_t source, bool ack, const void *dat
         bb.assign(start, start + length);
     }
 
-    FujiBusPacket packet(source, ack ? FUJICMD_ACK : FUJICMD_NAK, bb);
+    FujiBusPacket packet(source, ack ? CMD::FUJI_ACK : CMD::FUJI_NAK, bb);
     writeBusPacket(packet);
     return;
+}
+
+fujiDeviceID_t virtualDevice::id()
+{
+    return SYSTEM_BUS.fujiIDForDevice(this);
 }
 
 #endif /* BUILD_RS232 */

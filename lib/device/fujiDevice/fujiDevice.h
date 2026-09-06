@@ -5,6 +5,7 @@
 #include "Base64Mixin.h"
 #include "HashMixin.h"
 #include "QRMixin.h"
+#include "AppKeyMixin.h"
 
 #include "../fuji/fujiHost.h"
 #include "../fuji/fujiDisk.h"
@@ -13,6 +14,7 @@
 #include <optional>
 #include <map>
 #include <atomic>
+#include <functional>
 
 #define MAX_HOSTS MAX_HOST_SLOTS
 #define MAX_DISK_DEVICES MAX_MOUNT_SLOTS
@@ -21,12 +23,12 @@
 #define MAX_SSID_LEN 32
 #define MAX_WIFI_PASS_LEN 64
 
-#define MAX_APPKEY_LEN 64
-
 #define READ_DEVICE_SLOTS_DISKS1 0x00
 #define READ_DEVICE_SLOTS_TAPE 0x10
 
 #define STATUS_MOUNT_TIME       0x01
+
+#define FUJI_BOOTDISK get_disk_dev(0)
 
 #define ADAPTER_CONFIG_FIELDS \
     char ssid[33]; \
@@ -67,23 +69,6 @@ typedef struct
     char password[MAX_WIFI_PASS_LEN];
 } SSIDConfig;
 
-enum appkey_mode : int8_t
-{
-    APPKEYMODE_INVALID = -1,
-    APPKEYMODE_READ = 0,
-    APPKEYMODE_WRITE,
-    APPKEYMODE_READ_256
-};
-
-struct appkey
-{
-    uint16_t creator = 0;
-    uint8_t app = 0;
-    uint8_t key = 0;
-    appkey_mode mode = APPKEYMODE_INVALID;
-    uint8_t reserved = 0;
-} __attribute__((packed));
-
 struct disk_slot
 {
     uint8_t hostSlot;
@@ -114,7 +99,6 @@ enum DET_file_flags_t {
     DET_FF_TRUNC = 0x02,
 };
 
-#ifdef FUJI_MIXINS_ENABLED
 /* Mixin handling. This allows adding additional commands to a
    fujiDevice without having to mess around with the command handling
    in each subclass. Just add a mixin and add more commands.
@@ -131,6 +115,11 @@ concept FujiPacketLike = requires(T p) {
 
 static_assert(FujiPacketLike<FUJI_COMMAND_PACKET>,
               "FUJI_COMMAND_PACKET must satisfy FujiPacketLike");
+
+using FujiCommandHandlers = std::unordered_map<
+    fujiCommandID_t,
+    std::function<void(const FUJI_COMMAND_PACKET &)>
+    >;
 
 // This class inherits from all the mixins you list and tries each one in order
 template<typename... FujiDeviceMixins>
@@ -152,14 +141,12 @@ class FujiDeviceChain : public FujiDeviceMixins...
         return (FujiDeviceMixins::processCommand(packet) || ...);
     }
 };
-#endif // FUJI_MIXINS_ENABLED
 
-class fujiDevice : public virtual virtualDevice, public VDevMigrationWrapper
-#ifdef FUJI_MIXINS_ENABLED
-                 , public FujiDeviceChain<Base64Mixin, HashMixin, QRMixin>
-#endif // FUJI_MIXINS_ENABLED
+class fujiDevice : public virtual virtualDevice,
+                   public FujiDeviceChain<Base64Mixin, HashMixin, QRMixin, AppKeyMixin>
 {
 private:
+    FujiCommandHandlers handlers;
     bool hostMounted[MAX_HOSTS];
 
     void fujicmd_read_directory_block(uint8_t num_pages, uint8_t group_size);
@@ -176,52 +163,70 @@ protected:
         {2, 256}
     };
 
-    appkey _current_appkey;
     int _current_open_directory_slot = -1;
     uint8_t _countScannedSSIDs = 0;
 
     std::atomic<bool> _startup_mount_lock{false};
     unsigned char _active_rotate_slot = 0;
 
-#ifndef FUJI_HASH_MIXIN_ENABLED
-    // FIXME - remove when mixins enabled for all buses
-    Hash::Algorithm algorithm = Hash::Algorithm::UNKNOWN;
-#endif // FUJI_HASH_MIXIN_ENABLED
-
     virtual size_t set_additional_direntry_details(fsdir_entry_t *f, uint8_t *dest,
                                                    uint8_t maxlen) = 0;
     dirEntryDetails _additional_direntry_details(fsdir_entry_t *f);
+
+    // Platform hook for fujicore_mount_disk_image_success(): the base
+    // implementation calls DISK_DEVICE::mount() with its original 5-arg
+    // signature, so this stays the only call site that needs a
+    // platform-specific override rather than a #ifdef BUILD_* (banned here,
+    // see tests/check_no_build_ifdefs.py). rs232Fuji overrides this to pass
+    // `host` through to rs232Disk::mount(), which MediaTypeROM needs to open
+    // a same-named .cfg sibling through the same fujiHost the ROM itself
+    // came from -- see lib/media/rs232/diskTypeROM.cpp.
+    virtual mediatype_t mount_media(DISK_DEVICE *disk_dev, fujiDisk &disk, fujiHost &host,
+                                    disk_access_flags_t mode)
+    {
+        return disk_dev->mount(disk.fileh, disk.filename, disk.disk_size, mode);
+    }
+
+    // Slot holding the disk that currently answers as drive 1, or -1 when
+    // fewer than two disks are mounted and rotation is a no-op.
+    int get_rotate_slot();
+
+    // Platform hook for fujicmd_image_rotate(): announce the newly selected
+    // drive 1. Atari speaks it through SAM; everyone else stays quiet.
+    //
+    virtual void announce_rotation(int drive_slot) {}
 
     // ============ Validation of inputs ============
     success_is_true validate_host_slot(uint8_t slot, const char *dmsg=nullptr);
     success_is_true validate_device_slot(uint8_t slot, const char *dmsg = nullptr);
 
+    virtual void fujidev_set_device_fullpath(const FUJI_COMMAND_PACKET &packet) {
+        fujicmd_set_device_filename_success(packet.param(0), packet.param(1),
+                                            (disk_access_flags_t) ((uint8_t)
+                                                                   packet.param(2)));
+    }
+
 public:
     bool boot_config = true;
-    DISK_DEVICE bootdisk; // special disk drive just for configuration
 
     fujiDevice(unsigned int numDisk, std::string extension,
                std::optional<std::string> lobbyURL);
     virtual void setup() = 0;
     void shutdown() override;
 
-#ifdef FUJI_MIXINS_ENABLED
     // Return true if command was handled here
-    bool processCommand(const FUJI_COMMAND_PACKET &packet) {
-        return tryAllMixins(packet);
-    }
+    bool processCommand(const FUJI_COMMAND_PACKET &packet) override;
     // Return true if command is one that can be handled
-    bool recognizesCommand(const FUJI_COMMAND_PACKET &packet) {
-        return tryAllMixins(packet);
-    }
-#endif // FUJI_MIXINS_ENABLED
+    bool recognizesCommand(const FUJI_COMMAND_PACKET &packet);
 
     fujiHost *get_host(int i) { return &_fnHosts[i]; }
     std::string get_host_prefix(int host_slot) { return _fnHosts[host_slot].get_prefix(); }
 
     fujiDisk *get_disk(int i) { return &_fnDisks[i]; }
     virtual DISK_DEVICE *get_disk_dev(int i) { return &_fnDisks[i].disk_dev; }
-    int get_disk_id(int drive_slot) { return _fnDisks[drive_slot].disk_dev.id(); }
+    fujiDeviceID_t get_disk_id(int drive_slot) {
+        return SYSTEM_BUS.fujiIDForDevice(&_fnDisks[drive_slot].disk_dev);
+    }
 
     void populate_slots_from_config();
     void populate_config_from_slots();
@@ -238,7 +243,7 @@ public:
     virtual void fujicmd_net_scan_networks();
     void fujicmd_net_scan_result(uint8_t index);
     void fujicmd_net_get_ssid();
-    success_is_true fujicmd_net_set_ssid_success(const char *ssid, const char *password, bool save);
+    success_is_true fujicmd_net_set_ssid_success();
     void fujicmd_net_get_wifi_enabled();
     virtual success_is_true fujicmd_mount_disk_image_success(uint8_t deviceSlot, disk_access_flags_t access_mode);
     success_is_true fujicmd_unmount_disk_image_success(uint8_t deviceSlot);
@@ -267,25 +272,16 @@ public:
     void fujicmd_write_device_slots();
     void fujicmd_status();
 
-    // Move appkey stuff to its own file?
-    virtual void fujicmd_open_app_key();
-    void fujicmd_close_app_key();
-    void fujicmd_write_app_key(uint16_t keylen, uint16_t readlen=0);
-    void fujicmd_read_app_key();
-
     void fujicmd_generate_guid();
+    void fujicmd_random();
 
     // ============ Implementations by fujicmd_ methods ============
     // These are safe to call directly if the bus abstraction
     // (transaction_) doesn't suit the platform.
-    success_is_true fujicore_open_app_key(uint16_t creator, uint8_t app, uint8_t key,
-                                          appkey_mode mode, uint8_t reserved);
     SSIDInfo fujicore_net_scan_result(uint8_t index, bool *err=nullptr);
     SSIDConfig fujicore_net_get_ssid();
     uint8_t fujicore_net_get_wifi_status();
     uint8_t fujicore_net_get_wifi_enabled();
-    int fujicore_write_app_key(std::vector<uint8_t>&& value, int *err=nullptr);
-    virtual std::optional<std::vector<uint8_t>> fujicore_read_app_key();
     success_is_true fujicore_open_directory_success(uint8_t hostSlot, const std::string &dirpath);
     success_is_true fujicore_open_directory_success(uint8_t hostSlot, const std::string &dirpath,
                                                     const std::optional<std::string> &pattern);

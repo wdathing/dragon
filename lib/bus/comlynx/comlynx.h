@@ -6,16 +6,20 @@
  */
 
 #include "bus.h"
+#include "FujiLynxPacket.h"
 #include "global_types.h"
-#include "cmdFrame.h"
 #include "UARTChannel.h"
+#include "BoIPChannel.h"
 #include "fujiDeviceID.h"
 #include "fujiCommandID.h"
+#ifdef ESP_PLATFORM
 #include <freertos/queue.h>
+#endif /* ESP_PLATFORM */
 
 #include <forward_list>
 #include <map>
 
+#define FUJI_COMMAND_PACKET FujiLynxPacket
 
 #define COMLYNX_BAUDRATE 62500
 #define COMLYNX_IDLE_TIME 500
@@ -30,15 +34,6 @@ class lynxNetwork;
 class fujiDevice;
 
 /**
- * @brief Calculate checksum for Comlynx packets. Uses a simple 8-bit XOR of each successive byte.
- * @param buf pointer to buffer
- * @param len length of buffer
-
- * @return checksum value (0x00 - 0xFF)
- */
-uint8_t comlynx_checksum(uint8_t *buf, unsigned short len);
-
-/**
  * @brief An Comlynx Device
  */
 class virtualDevice
@@ -47,52 +42,9 @@ class virtualDevice
     friend fujiDevice;
 
 protected:
-    void comlynx_send_length(uint16_t l);
-    void comlynx_send(uint8_t b);
-    void comlynx_send_buffer(uint8_t *buf, unsigned short len);
-    bool comlynx_recv_ck();
-    uint8_t comlynx_recv();
-    uint16_t comlynx_recv_length();
-    uint32_t comlynx_recv_blockno();
-    unsigned short comlynx_recv_buffer(uint8_t *buf, unsigned short len);
-    virtual void comlynx_response_ack();
-    virtual void comlynx_response_nack();
-
-    transState_t _transaction_state = TRANS_STATE::INVALID;
-    virtual void transaction_begin(transState_t expectMoreData);
-    virtual void transaction_complete();
-    virtual void transaction_error();
-    virtual success_is_true transaction_get(void *data, size_t len);
-    virtual void transaction_put(const void *data, size_t len, bool err=false);
-
     virtual void reset();
     virtual void shutdown() {}
-    virtual void comlynx_process();
-
-
-
-    /**
-     * @brief Device Number: 0-15
-     */
-    fujiDeviceID_t _devnum;
-
-    /**
-     * @brief command frame, used by network protocol, ultimately
-     */
-    cmdFrame_t cmdFrame;
-
-    /**
-     * Response buffer and length
-     */
-    uint8_t response[1024];
-    uint16_t response_len;
-
-    /**
-     * Receive buffer, length and point into recvbuffer
-     */
-    uint8_t recvbuffer[1024];
-    uint16_t recvbuffer_len = 0;
-    uint8_t *recvbuf_pos;
+    virtual void comlynx_process(const FujiLynxPacket &packet);
 
 public:
 
@@ -110,23 +62,22 @@ public:
      * @brief return the device number (0-15) of this device
      * @return the device # (0-15) of this device
      */
-    fujiDeviceID_t id() { return _devnum; }
+    fujiDeviceID_t id();
 };
 
 /**
  * @brief The Comlynx Bus
  */
-class systemBus
+class systemBus : public SystemBusBase
 {
 private:
-    std::forward_list<virtualDevice *> _daisyChain;
     virtualDevice *_activeDev = nullptr;
-    lynxFuji *_fujiDev = nullptr;
-    lynxPrinter *_printerDev = nullptr;
-    lynxNetwork *_netDev[8] = {nullptr};
+    const FujiLynxPacket *_activePacket;
     lynxNetStream *_streamDev = nullptr;
 
-    UARTChannel _port;
+    IOChannel *_port;
+    UARTChannel _serial;
+    BoIPChannel _boip;
 
     void _comlynx_process_cmd();
     void _comlynx_process_queue();
@@ -145,17 +96,8 @@ public:
     bool wait_for_idle();
     bool netstreamActive() const;
 
-    int numDevices();
-    void addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id);
-    void remDevice(virtualDevice *pDevice);
-    void remDevice(fujiDeviceID_t device_id);
-    bool deviceExists(fujiDeviceID_t device_id);
-    void enableDevice(fujiDeviceID_t device_id);
-    void disableDevice(fujiDeviceID_t device_id);
-    virtualDevice *deviceById(fujiDeviceID_t device_id);
-    void changeDeviceId(virtualDevice *pDevice, int device_id);
-    bool deviceEnabled(fujiDeviceID_t device_id);
-    QueueHandle_t qComlynxMessages = nullptr;
+    void addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id) override;
+
     void setStreamHost(const char *newhost, int port);
     void setStreamHostWithOptions(const char *newhost, int port, int mode, bool register_enabled, bool redeye_enabled);
 
@@ -165,17 +107,28 @@ public:
     bool shuttingDown = false;                                  // TRUE if we are in shutdown process
     bool getShuttingDown() { return shuttingDown; };
 
+    void transaction_accept(transState_t expectMoreData) override;
+    void transaction_success() override;
+    void transaction_error() override;
+    success_is_true transaction_get(void *data, size_t len) override;
+    using SystemBusBase::transaction_send;
+    void transaction_send(const void *data, size_t len, bool is_error=false) override;
+
+    void writeBusPacket(const FujiLynxPacket &packet);
+    void sendAckPacket();
+    void sendNakPacket();
+
     // Everybody thinks "oh I know how a serial port works, I'll just
     // access it directly and bypass the bus!" ಠ_ಠ
-    size_t read(void *buffer, size_t length) { return _port.read(buffer, length); }
-    size_t read() { return _port.read(); }
-    size_t write(const void *buffer, size_t length) { return _port.write(buffer, length); }
-    size_t write(int n) { return _port.write(n); }
-    size_t available() { return _port.available(); }
-    void flush() { _port.flushOutput(); }
-    size_t print(int n, int base = 10) { return _port.print(n, base); }
-    size_t print(const char *str) { return _port.print(str); }
-    size_t print(const std::string &str) { return _port.print(str); }
+    size_t read(void *buffer, size_t length) { return _port->read(buffer, length); }
+    size_t read() { return _port->read(); }
+    size_t write(const void *buffer, size_t length) { return _port->write(buffer, length); }
+    size_t write(int n) { return _port->write(n); }
+    size_t available() { return _port->available(); }
+    void flush() { _port->flushOutput(); }
+    size_t print(int n, int base = 10) { return _port->print(n, base); }
+    size_t print(const char *str) { return _port->print(str); }
+    size_t print(const std::string &str) { return _port->print(str); }
 };
 
 extern systemBus SYSTEM_BUS;

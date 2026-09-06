@@ -6,18 +6,8 @@
 
 #include "network.h"
 #include "../network.h"
-
-#include <cstring>
-#include <ctype.h>
-#include <algorithm>
-
-#include "../../include/debug.h"
-
-#include "utils.h"
-#include "string_utils.h"
-
-#include "status_error_codes.h"
 #include "NetworkProtocolFactory.h"
+#include "utils.h"
 
 using namespace std;
 
@@ -93,6 +83,7 @@ void iwmNetwork::open(const iwm_decoded_cmd_t &cmd)
         // manually force the memory out
         current_network_data.protocol.reset();
         current_network_data.json.reset();
+        current_network_data.sgml.reset();
         current_network_data.urlParser.reset();
     }
 
@@ -141,6 +132,9 @@ void iwmNetwork::open(const iwm_decoded_cmd_t &cmd)
     current_network_data.json = std::make_unique<FNJSON>();
     current_network_data.json->setProtocol(current_network_data.protocol.get());
     current_network_data.json->setLineEnding("\x0a");
+    current_network_data.sgml = std::make_unique<FNSGML>();
+    current_network_data.sgml->setProtocol(current_network_data.protocol.get());
+    current_network_data.sgml->setLineEnding("\x0a");
 
     SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     SYSTEM_BUS.transaction_success();
@@ -174,6 +168,7 @@ void iwmNetwork::close()
     // technically not required as removing the item from the map will also remove the value
     if (current_network_data.protocol) current_network_data.protocol.reset();
     if (current_network_data.json) current_network_data.json.reset();
+    if (current_network_data.sgml) current_network_data.sgml.reset();
     if (current_network_data.urlParser) current_network_data.urlParser.reset();
 
     network_data_map.erase(current_network_unit);
@@ -287,6 +282,10 @@ void iwmNetwork::channel_mode(const iwm_decoded_cmd_t &cmd)
         Debug_printf("channelMode = JSON\n");
         current_network_data.channelMode = mode;
         break;
+    case CHANNEL_MODE::SGML:
+        Debug_printf("channelMode = SGML\n");
+        current_network_data.channelMode = mode;
+        break;
     default:
         Debug_printf("INVALID MODE = %02x\r\n", mode);
         SYSTEM_BUS.transaction_error();
@@ -315,16 +314,47 @@ void iwmNetwork::json_parse()
     SYSTEM_BUS.transaction_success();
 }
 
+void iwmNetwork::sgml_query(const iwm_decoded_cmd_t &cmd)
+{
+    auto& current_network_data = network_data_map[current_network_unit];
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    std::string buffer = cmd.dataAsString().value();
+    buffer.resize(strlen(buffer.c_str())); // Truncate to null terminator
+
+    // Unlike JSON, a CSS selector can contain colons (e.g. div:first-child), so
+    // only strip a leading "N:"/"N#:" device prefix rather than splitting on a colon.
+    if (buffer.size() >= 2 && (buffer[0] == 'N' || buffer[0] == 'n'))
+    {
+        size_t p = 1;
+        if (p < buffer.size() && buffer[p] >= '0' && buffer[p] <= '9')
+            p++;
+        if (p < buffer.size() && buffer[p] == ':')
+            buffer.erase(0, p + 1);
+    }
+
+    Debug_printf("\r\nSGML query set to: %s, data_len: %d\r\n", buffer.c_str(), buffer.size());
+    current_network_data.sgml->setReadQuery(buffer, 0);
+    SYSTEM_BUS.transaction_success();
+}
+
+void iwmNetwork::sgml_parse()
+{
+    auto& current_network_data = network_data_map[current_network_unit];
+    current_network_data.sgml->parse();
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
+}
+
 void iwmNetwork::iwm_open(const iwm_decoded_cmd_t &cmd)
 {
     // nothing in fujinet-lib calls this, it does a control with open command. This is used only by the Apple/// as it has no fn-lib support yet
-    SYSTEM_BUS.transaction_error(SP_ERR::NOERROR);
+    SYSTEM_BUS.transaction_success();
 }
 
 void iwmNetwork::iwm_close(const iwm_decoded_cmd_t &cmd)
 {
     // nothing in fujinet-lib calls this, it does a control with close command. This is used only by the Apple/// as it has no fn-lib support yet
-    SYSTEM_BUS.transaction_error(SP_ERR::NOERROR);
+    SYSTEM_BUS.transaction_success();
     close();
 }
 
@@ -355,6 +385,10 @@ void iwmNetwork::status()
         current_network_data.json->status(&s);
         avail = current_network_data.json->available();
         break;
+    case CHANNEL_MODE::SGML:
+        current_network_data.sgml->status(&s);
+        avail = current_network_data.sgml->available();
+        break;
     }
 
     Debug_printf("Bytes Waiting: 0x%02x, Connected: %u, Error: %u\n", avail, s.connected, s.error);
@@ -378,18 +412,19 @@ void iwmNetwork::iwm_status(const iwm_decoded_cmd_t &cmd)
     }
 
 #ifdef DEBUG
-    Debug_printf("\r\n[NETWORK] Device %02x Status Code %02x('%c') net_unit %02x\r\n", id(), cmd.command(), isprint(cmd.command()) ? (char) cmd.command() : '.', current_network_unit);
+    uint8_t u_cmd = (uint8_t) cmd.command();
+    Debug_printf("\r\n[NETWORK] Device %02x Status Code %02x('%c') net_unit %02x\r\n", id(), u_cmd, isprint(u_cmd) ? (char) u_cmd : '.', current_network_unit);
 #endif
 
     switch (cmd.command())
     {
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         get_prefix();
         break;
-    case NETCMD_READ:
+    case CMD::NET_READ:
         net_read();
         break;
-    case NETCMD_STATUS:
+    case CMD::NET_STATUS:
         status();
         break;
     default:
@@ -418,6 +453,27 @@ error_is_true iwmNetwork::read_channel_json(const iwm_decoded_cmd_t &cmd)
                                    current_network_data.json->readValueLen());
     ByteBuffer buffer(rlen, 0);
     current_network_data.json->readValue(buffer.data(), buffer.size());
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_send(buffer);
+    RETURN_SUCCESS_AS_FALSE();
+}
+
+error_is_true iwmNetwork::read_channel_sgml(const iwm_decoded_cmd_t &cmd)
+{
+    auto& current_network_data = network_data_map[current_network_unit];
+    Debug_printf("read_channel_sgml - num_bytes: %02x, sgml_bytes_remaining: %02x\n",
+                 cmd.frame.char_rw.length, current_network_data.sgml->available());
+    if (current_network_data.sgml->available() == 0) // if no bytes, we just return with no data
+    {
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+        SYSTEM_BUS.transaction_success();
+        RETURN_ERROR_AS_TRUE();
+    }
+
+    auto rlen = std::min<uint16_t>(cmd.frame.char_rw.length,
+                                   current_network_data.sgml->readValueLen());
+    ByteBuffer buffer(rlen, 0);
+    current_network_data.sgml->readValue(buffer.data(), buffer.size());
     SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     SYSTEM_BUS.transaction_send(buffer);
     RETURN_SUCCESS_AS_FALSE();
@@ -453,6 +509,7 @@ error_is_true iwmNetwork::write_channel(unsigned short num_bytes)
     case CHANNEL_MODE::PROTOCOL:
         current_network_data.protocol->write(num_bytes);
     case CHANNEL_MODE::JSON:
+    case CHANNEL_MODE::SGML:
         break;
     }
     RETURN_SUCCESS_AS_FALSE();
@@ -480,6 +537,9 @@ void iwmNetwork::iwm_read(const iwm_decoded_cmd_t &cmd)
         break;
     case CHANNEL_MODE::JSON:
         read_channel_json(cmd);
+        break;
+    case CHANNEL_MODE::SGML:
+        read_channel_sgml(cmd);
         break;
     }
 }
@@ -541,78 +601,85 @@ void iwmNetwork::iwm_ctrl(const iwm_decoded_cmd_t &cmd)
     auto& current_network_data = network_data_map[current_network_unit];
 
 #ifdef DEBUG
-    if (cmd.command() == NETCMD_SET_CHANNEL)
-        Debug_printf("\r\nNet Device %02x Control Code %02x('%c') net_unit %02x", id(), cmd.command(), isprint(cmd.command()) ? (char)cmd.command() : '.', cmd.param(0));
+    uint8_t u_cmd = (uint8_t) cmd.command();
+    if (cmd.command() == CMD::NET_SET_CHANNEL)
+        Debug_printf("\r\nNet Device %02x Control Code %02x('%c') net_unit %02x", id(), u_cmd, isprint(u_cmd) ? (char)u_cmd : '.', cmd.param(0));
     else
-        Debug_printf("\r\nNet Device %02x Control Code %02x('%c') net_unit %02x", id(), cmd.command(), isprint(cmd.command()) ? (char)cmd.command() : '.', current_network_unit);
+        Debug_printf("\r\nNet Device %02x Control Code %02x('%c') net_unit %02x", id(), u_cmd, isprint(u_cmd) ? (char)u_cmd : '.', current_network_unit);
 #endif
 
     // Debug_printv("cmd (looking for network_unit in byte 6, i.e. hex[5]):\r\n%s\r\n", mstr::toHex(cmd.frame.decoded, 9).c_str());
 
-    if (cmd.command() != NETCMD_OPEN && current_network_data.json == nullptr) {
+    if (cmd.command() != CMD::NET_OPEN && current_network_data.json == nullptr) {
         Debug_printv("control should not be called on a non-open channel - FN was probably reset");
     }
 
     switch (cmd.command())
     {
-    case NETCMD_SET_CHANNEL:
+    case CMD::NET_SET_CHANNEL:
         current_network_unit = cmd.param(0);
         // control command still needs a bus reply or the host times out
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         SYSTEM_BUS.transaction_success();
         break;
-    case NETCMD_CHDIR:
+    case CMD::NET_CHDIR:
         set_prefix(cmd);
         break;
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         get_prefix();
         break;
-    case NETCMD_OPEN:
+    case CMD::NET_OPEN:
         open(cmd);
         break;
-    case NETCMD_CLOSE:
+    case CMD::NET_CLOSE:
         close();
         break;
-    case NETCMD_WRITE:
+    case CMD::NET_WRITE:
         net_write(cmd);
         break;
-    case NETCMD_CHANNEL_MODE:
+    case CMD::NET_CHANNEL_MODE:
         channel_mode(cmd);
         break;
-    case NETCMD_USERNAME: // login
+    case CMD::NET_USERNAME: // login
         set_login(cmd);
         break;
-    case NETCMD_PASSWORD: // password
+    case CMD::NET_PASSWORD: // password
         set_password(cmd);
         break;
 
-    case NETCMD_PARSE:
-        json_parse();
+    case CMD::NET_PARSE:
+        if (current_network_data.channelMode == CHANNEL_MODE::SGML)
+            sgml_parse();
+        else
+            json_parse();
         break;
-    case NETCMD_QUERY:
-        json_query(cmd);
+    case CMD::NET_QUERY:
+        if (current_network_data.channelMode == CHANNEL_MODE::SGML)
+            sgml_query(cmd);
+        else
+            json_query(cmd);
         break;
 
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
         process_fs(cmd);
         break;
 
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
         process_tcp(cmd);
         break;
 
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         process_http(cmd);
         break;
 
-    case NETCMD_GET_REMOTE:
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_GET_REMOTE:
+    case CMD::NET_SET_DESTINATION:
         process_udp(cmd);
         break;
 
@@ -658,8 +725,7 @@ void iwmNetwork::create_devicespec(string d, bool is_dir)
 void iwmNetwork::create_url_parser()
 {
     auto& current_network_data = network_data_map[current_network_unit];
-    std::string url = current_network_data.deviceSpec.substr(current_network_data.deviceSpec.find(":") + 1);
-    current_network_data.urlParser = std::move(PeoplesUrlParser::parseURL(url));
+    current_network_data.urlParser = std::move(PeoplesUrlParser::parseURL(current_network_data.deviceSpec));
 }
 
 error_is_true iwmNetwork::parse_and_instantiate_protocol(string d, bool is_dir)
@@ -725,22 +791,22 @@ void iwmNetwork::process_fs(const iwm_decoded_cmd_t &cmd)
     auto url = current_network_data.urlParser.get();
     switch (cmd.command())
     {
-    case NETCMD_RENAME:
+    case CMD::NET_RENAME:
         cmd_err = fs->rename(url);
         break;
-    case NETCMD_DELETE:
+    case CMD::NET_DELETE:
         cmd_err = fs->del(url);
         break;
-    case NETCMD_LOCK:
+    case CMD::NET_LOCK:
         cmd_err = fs->lock(url);
         break;
-    case NETCMD_UNLOCK:
+    case CMD::NET_UNLOCK:
         cmd_err = fs->unlock(url);
         break;
-    case NETCMD_MKDIR:
+    case CMD::NET_MKDIR:
         cmd_err = fs->mkdir(url);
         break;
-    case NETCMD_RMDIR:
+    case CMD::NET_RMDIR:
         cmd_err = fs->rmdir(url);
         break;
     default:
@@ -773,10 +839,10 @@ void iwmNetwork::process_tcp(const iwm_decoded_cmd_t &cmd)
     fujiError_t cmd_err;
     switch (cmd.command())
     {
-    case NETCMD_CONTROL:
+    case CMD::NET_CONTROL:
         cmd_err = tcp->accept_connection();
         break;
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CLOSE_CLIENT:
         cmd_err = tcp->close_client_connection();
         break;
     default:
@@ -809,7 +875,7 @@ void iwmNetwork::process_http(const iwm_decoded_cmd_t &cmd)
     fujiError_t cmd_err;
     switch (cmd.command())
     {
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         cmd_err = http->set_channel_mode((netProtoHTTPChannelMode_t) cmd.param8(1));
         break;
     default:
@@ -841,7 +907,7 @@ void iwmNetwork::process_udp(const iwm_decoded_cmd_t &cmd)
     switch (cmd.command())
     {
 #ifndef ESP_PLATFORM
-    case NETCMD_GET_REMOTE:
+    case CMD::NET_GET_REMOTE:
         {
             ByteBuffer buffer(SPECIAL_BUFFER_SIZE, 0);
             SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
@@ -850,7 +916,7 @@ void iwmNetwork::process_udp(const iwm_decoded_cmd_t &cmd)
         }
         break;
 #endif /* ESP_PLATFORM */
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_SET_DESTINATION:
         {
             SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
             auto data = cmd.data().value();

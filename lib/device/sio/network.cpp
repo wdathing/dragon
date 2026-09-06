@@ -6,27 +6,12 @@
 
 #include "network.h"
 #include "../network.h"
-
-#include <cstring>
-#include <string>
-#include <algorithm>
-#include <vector>
-#include <memory>
-#include <sstream>
-
-#include "../../include/debug.h"
-#include "../../include/pinmap.h"
-
+#include "NetworkProtocolFactory.h"
 #include "fnSystem.h"
 #include "utils.h"
-#include "fuji_endian.h"
+#include "debug.h"
 
-#include "status_error_codes.h"
-
-#include "TCP.h"
-#include "UDP.h"
-#include "HTTP.h"
-#include "FS.h"
+#include <sstream>
 
 using namespace std;
 
@@ -73,9 +58,7 @@ sioNetwork::~sioNetwork()
 #endif
 
     // first, delete protocol instance
-    if (protocol != nullptr)
-        delete protocol;
-    protocol = nullptr;
+    protocol.reset();
 
     // then delete all buffers
     receiveBuffer->clear();
@@ -121,19 +104,17 @@ void sioNetwork::sio_open(const FujiSIOPacket &packet)
     if (protocol != nullptr)
     {
         protocol->close();
-        delete protocol;
-        protocol = nullptr;
-    }
-
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
+        protocol.reset();
     }
 
     if (json != nullptr) {
         delete json;
         json = nullptr;
+    }
+
+    if (sgml != nullptr) {
+        delete sgml;
+        sgml = nullptr;
     }
 
     if (urlParser != nullptr) {
@@ -149,13 +130,6 @@ void sioNetwork::sio_open(const FujiSIOPacket &packet)
 
     if (protocol == nullptr)
     {
-        // invalid devicespec error already passed in.
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
-
         // SYSTEM_BUS.transaction_error() - was already called from parse_and_instantiate_protocol()
         return;
     }
@@ -164,9 +138,12 @@ void sioNetwork::sio_open(const FujiSIOPacket &packet)
     netProtoTranslation_t open_trans = (netProtoTranslation_t) packet.param8(1);
 
     // Ignore aux2 value if NTRANS set 0xFF, for ACTION!
-    if (trans_aux2 == 0xFF)
+    if ((uint8_t)trans_aux2 == 0xFF)
         open_trans = NETPROTO_TRANS_NONE;
-    else if (open_mode != ACCESS_MODE::DIRECTORY) // don't xlate dir listings.
+    // Don't xlate dir listings. DIRECTORY_ALT counts too: protocols that read
+    // aux2 as a width or format (Mailbox, Calendar) would see it corrupted by a
+    // sticky NTRANS value ORed in here.
+    else if (open_mode != ACCESS_MODE::DIRECTORY && open_mode != ACCESS_MODE::DIRECTORY_ALT)
     {
         unsigned flags = (unsigned) open_trans | trans_aux2;
         open_trans = (netProtoTranslation_t) flags;
@@ -177,14 +154,7 @@ void sioNetwork::sio_open(const FujiSIOPacket &packet)
     {
         status.error = protocol->error;
         Debug_printf("Protocol unable to make connection. Error: %d\n", status.error);
-        delete protocol;
-        protocol = nullptr;
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
-
+        protocol.reset();
         SYSTEM_BUS.transaction_error();
         return;
     }
@@ -198,7 +168,13 @@ void sioNetwork::sio_open(const FujiSIOPacket &packet)
     // TODO: Finally, go ahead and let the parsers know
     json = new FNJSON();
     json->setLineEnding("\x9b");
-    json->setProtocol(protocol);
+    json->setProtocol(protocol.get());
+
+    sgml = new FNSGML();
+    sgml->setLineEnding("\x9b");
+    sgml->setProtocol(protocol.get());
+    sgml_bytes_remaining = 0; // reset per-open so a prior session's count doesn't leak
+
     channelMode = PROTOCOL;
 
     // And signal complete!
@@ -220,12 +196,6 @@ void sioNetwork::sio_close()
 
     status.reset();
 
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
-    }
-
     // If no protocol enabled, we just signal complete, and return.
     if (protocol == nullptr)
     {
@@ -233,20 +203,29 @@ void sioNetwork::sio_close()
         return;
     }
 
-    // Ask the protocol to close
+    // Ask the protocol to close. Latch its error so the STATUS that follows a
+    // failed commit-on-close (e.g. a calendar compose) can still report it.
     if (protocol->close() != FUJI_ERROR::NONE)
+    {
+        status.error = protocol->error;
         SYSTEM_BUS.transaction_error();
+    }
     else
         SYSTEM_BUS.transaction_success();
 
     // Delete the protocol object
-    delete protocol;
-    protocol = nullptr;
+    protocol.reset();
 
     if (json != nullptr)
     {
         delete json;
         json = nullptr;
+    }
+
+    if (sgml != nullptr)
+    {
+        delete sgml;
+        sgml = nullptr;
     }
 
 #ifdef ESP_PLATFORM
@@ -284,12 +263,6 @@ void sioNetwork::sio_read(const FujiSIOPacket &packet)
     // If protocol isn't connected, then return not connected.
     if (protocol == nullptr)
     {
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
-
         status.error = NDEV_STATUS::NOT_CONNECTED;
         SYSTEM_BUS.transaction_error();
         return;
@@ -319,6 +292,20 @@ fujiError_t sioNetwork::sio_read_channel_json(unsigned short num_bytes)
 }
 
 /**
+ * @brief Perform read of the current SGML channel
+ * @param num_bytes Number of bytes to read
+ */
+fujiError_t sioNetwork::sio_read_channel_sgml(unsigned short num_bytes)
+{
+    if (num_bytes > sgml_bytes_remaining)
+        sgml_bytes_remaining=0;
+    else
+        sgml_bytes_remaining-=num_bytes;
+
+    return FUJI_ERROR::NONE;
+}
+
+/**
  * Perform the channel read based on the channelMode
  * @param num_bytes - number of bytes to read from channel.
  * @return FUJI_ERROR::UNSPECIFIED on error, FUJI_ERROR::NONE on success. Passed directly to SYSTEM_BUS.transaction_send().
@@ -334,6 +321,9 @@ fujiError_t sioNetwork::sio_read_channel(unsigned short num_bytes)
         break;
     case JSON:
         err = sio_read_channel_json(num_bytes);
+        break;
+    case SGML:
+        err = sio_read_channel_sgml(num_bytes);
         break;
     }
     return err;
@@ -358,11 +348,6 @@ void sioNetwork::sio_write(const FujiSIOPacket &packet)
     // If protocol isn't connected, then return not connected.
     if (protocol == nullptr)
     {
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
         status.error = NDEV_STATUS::NOT_CONNECTED;
         SYSTEM_BUS.transaction_error();
         return;
@@ -404,6 +389,10 @@ fujiError_t sioNetwork::sio_write_channel(unsigned short num_bytes)
         break;
     case JSON:
         Debug_printf("JSON Not Handled.\n");
+        err = FUJI_ERROR::UNSPECIFIED;
+        break;
+    case SGML:
+        Debug_printf("SGML Not Handled.\n");
         err = FUJI_ERROR::UNSPECIFIED;
         break;
     }
@@ -485,6 +474,13 @@ error_is_true sioNetwork::sio_status_channel_json(NetworkStatus *ns)
     RETURN_SUCCESS_AS_FALSE(); // for now
 }
 
+error_is_true sioNetwork::sio_status_channel_sgml(NetworkStatus *ns)
+{
+    ns->connected = sgml_bytes_remaining > 0;
+    ns->error = sgml_bytes_remaining > 0 ? NDEV_STATUS::SUCCESS : NDEV_STATUS::END_OF_FILE;
+    RETURN_SUCCESS_AS_FALSE(); // for now
+}
+
 /**
  * @brief perform channel status commands, if there is a protocol bound.
  */
@@ -518,6 +514,10 @@ void sioNetwork::sio_status_channel()
     case JSON:
         sio_status_channel_json(&status);
         avail = json_bytes_remaining;
+        break;
+    case SGML:
+        sio_status_channel_sgml(&status);
+        avail = sgml_bytes_remaining;
         break;
     }
     // clear forced flag (first status after open)
@@ -563,7 +563,7 @@ void sioNetwork::sio_set_prefix()
     uint8_t prefixSpec[256];
     string prefixSpec_str;
 
-    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
 
     memset(prefixSpec, 0, sizeof(prefixSpec));
 
@@ -656,6 +656,10 @@ void sioNetwork::sio_set_channel_mode(const FujiSIOPacket &packet)
         channelMode = JSON;
         SYSTEM_BUS.transaction_success();
         break;
+    case 2:
+        channelMode = SGML;
+        SYSTEM_BUS.transaction_success();
+        break;
     default:
         SYSTEM_BUS.transaction_error();
     }
@@ -702,7 +706,7 @@ void sioNetwork::sio_set_password()
 void sioNetwork::sio_get_dstats_value(const FujiSIOPacket &packet)
 {
     SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
-    uint8_t command = packet.param(0);
+    fujiCommandID_t command = (fujiCommandID_t) packet.param8(0);
     uint8_t dstats = get_dstats_for_command(command);
     SYSTEM_BUS.transaction_send(&dstats, 1, false);
 }
@@ -787,92 +791,98 @@ void sioNetwork::sio_process(const FujiSIOPacket &packet)
 
     switch (packet.command())
     {
-    case NETCMD_HSIO_INDEX:
+    case CMD::NET_HSIO_INDEX:
         sio_high_speed();
         break;
-    case NETCMD_OPEN:
+    case CMD::NET_OPEN:
         sio_open(packet);
         break;
-    case NETCMD_CLOSE:
+    case CMD::NET_CLOSE:
         sio_close();
         break;
-    case NETCMD_READ:
+    case CMD::NET_READ:
         sio_read(packet);
         break;
-    case NETCMD_WRITE:
+    case CMD::NET_WRITE:
         sio_write(packet);
         break;
-    case NETCMD_STATUS:
+    case CMD::NET_STATUS:
         sio_status(packet);
         break;
 
-    case NETCMD_PARSE:
-        sio_parse_json();
+    case CMD::NET_PARSE:
+        if (channelMode == SGML)
+            sio_parse_sgml();
+        else
+            sio_parse_json();
         break;
-    case NETCMD_TRANSLATION:
+    case CMD::NET_TRANSLATION:
         sio_set_translation(packet);
         break;
-    case NETCMD_SET_EOL:
+    case CMD::NET_SET_EOL:
         sio_set_eol(packet);
         break;
-    case NETCMD_SET_INT_RATE:
+    case CMD::NET_SET_INT_RATE:
         sio_set_timer_rate(packet);
         break;
-    case NETCMD_SET_PARAMETERS: // JSON parameter wrangling
+    case CMD::NET_SET_PARAMETERS: // JSON parameter wrangling
         sio_set_json_parameters(packet);
         break;
-    case NETCMD_CHANNEL_MODE:
+    case CMD::NET_CHANNEL_MODE:
         sio_set_channel_mode(packet);
         break;
 
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         sio_get_prefix();
         break;
 
-    case NETCMD_CHDIR:
+    case CMD::NET_CHDIR:
         sio_set_prefix();
         return;
-    case NETCMD_QUERY:
-        sio_set_json_query(packet);
+    case CMD::NET_QUERY:
+        if (channelMode == SGML)
+            sio_set_sgml_query(packet);
+        else
+            sio_set_json_query(packet);
         return;
-    case NETCMD_USERNAME:
+    case CMD::NET_USERNAME:
         sio_set_login();
         return;
-    case NETCMD_PASSWORD:
+    case CMD::NET_PASSWORD:
         sio_set_password();
         return;
 
-    case NETCMD_GET_DSTATS_VALUE:
+    case CMD::NET_GET_DSTATS_VALUE:
         sio_get_dstats_value(packet);
         break;
 
-    case NETCMD_SEEK: // POINT
+    case CMD::NET_SEEK: // POINT
         sio_seek();
         break;
-    case NETCMD_TELL: // NOTE
+    case CMD::NET_TELL: // NOTE
         sio_tell();
         break;
 
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
         process_fs(packet);
         break;
 
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
         process_tcp(packet);
         break;
 
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         process_http(packet);
         break;
 
-    case NETCMD_GET_REMOTE:
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_GET_REMOTE:
+    case CMD::NET_SET_DESTINATION:
         process_udp(packet);
         break;
 
@@ -928,44 +938,44 @@ void sioNetwork::sio_poll_interrupt()
  * @param command The network command code (typically from aux1)
  * @return The DSTATS byte value for that command
  */
-uint8_t sioNetwork::get_dstats_for_command(uint8_t command)
+uint8_t sioNetwork::get_dstats_for_command(fujiCommandID_t command)
 {
     switch (command)
     {
     // No payload commands (0x00)
-    case NETCMD_CLOSE:
-    case NETCMD_PARSE:
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
-    case NETCMD_CHANNEL_MODE:
-    case NETCMD_TRANSLATION:
-    case NETCMD_SET_INT_RATE:
-    case NETCMD_SET_PARAMETERS:
+    case CMD::NET_CLOSE:
+    case CMD::NET_PARSE:
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
+    case CMD::NET_CHANNEL_MODE:
+    case CMD::NET_TRANSLATION:
+    case CMD::NET_SET_INT_RATE:
+    case CMD::NET_SET_PARAMETERS:
         return SIO_DIRECTION_NONE;
 
     // Payload from FujiNet to Atari (0x40)
-    case NETCMD_HSIO_INDEX:
-    case NETCMD_READ:
-    case NETCMD_STATUS:
-    case NETCMD_GETCWD:
-    case NETCMD_TELL:
+    case CMD::NET_HSIO_INDEX:
+    case CMD::NET_READ:
+    case CMD::NET_STATUS:
+    case CMD::NET_GETCWD:
+    case CMD::NET_TELL:
         return SIO_DIRECTION_READ;
 
     // Payload from Atari to FujiNet (0x80)
-    case NETCMD_OPEN:
-    case NETCMD_WRITE:
-    case NETCMD_CHDIR:
-    case NETCMD_QUERY:
-    case NETCMD_USERNAME:
-    case NETCMD_PASSWORD:
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
-    case NETCMD_SET_DESTINATION:
-    case NETCMD_SEEK:
+    case CMD::NET_OPEN:
+    case CMD::NET_WRITE:
+    case CMD::NET_CHDIR:
+    case CMD::NET_QUERY:
+    case CMD::NET_USERNAME:
+    case CMD::NET_PASSWORD:
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
+    case CMD::NET_SET_DESTINATION:
+    case CMD::NET_SEEK:
         return SIO_DIRECTION_WRITE;
 
     // Invalid/unknown command
@@ -980,12 +990,7 @@ uint8_t sioNetwork::get_dstats_for_command(uint8_t command)
  */
 success_is_true sioNetwork::instantiate_protocol()
 {
-    if (!protocolParser)
-    {
-        protocolParser = new ProtocolParser();
-    }
-
-    protocol = protocolParser->createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
+    protocol = NetworkProtocolFactory::createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
 
     if (protocol == nullptr)
     {
@@ -994,7 +999,7 @@ success_is_true sioNetwork::instantiate_protocol()
     }
 
     // Atari's native EOL is the ATASCII end-of-line (0x9B), unless the client
-    // has overridden it with the NETCMD_SET_EOL command.
+    // has overridden it with the CMD::NET_SET_EOL command.
     protocol->native_eol = native_eol_override.empty() ? STR_ATASCII_EOL : native_eol_override;
 
     // leaving this one to print
@@ -1024,8 +1029,7 @@ void sioNetwork::create_devicespec(bool is_dir)
 */
 void sioNetwork::create_url_parser()
 {
-    std::string url = deviceSpec.substr(deviceSpec.find(":") + 1);
-    urlParser = PeoplesUrlParser::parseURL(url);
+    urlParser = PeoplesUrlParser::parseURL(deviceSpec);
 }
 
 void sioNetwork::parse_and_instantiate_protocol(bool is_dir)
@@ -1119,7 +1123,7 @@ void sioNetwork::processCommaFromDevicespec(fujiDeviceID_t device)
 
         if (item[0] != 'N')
             continue;                                       // not us.
-        else if (item[1] == ':' && device != FUJI_DEVICEID_NETWORK) // N: but we aren't N1:
+        else if (item[1] == ':' && device != FUJI_DEVICEID::NETWORK) // N: but we aren't N1:
             continue;                                       // also not us.
         else
         {
@@ -1248,6 +1252,58 @@ void sioNetwork::sio_set_json_query(const FujiSIOPacket &packet)
     SYSTEM_BUS.transaction_success();
 }
 
+void sioNetwork::sio_parse_sgml()
+{
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    sgml->parse();
+    SYSTEM_BUS.transaction_success();
+}
+
+void sioNetwork::sio_set_sgml_query(const FujiSIOPacket &packet)
+{
+    uint8_t in[256];
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+
+    memset(in, 0, sizeof(in));
+
+    SYSTEM_BUS.transaction_get(in, sizeof(in)); // TODO test checksum
+
+    // strip away line endings from input spec.
+    for (int i = 0; i < 256; i++)
+    {
+        if (in[i] == 0x0A || in[i] == 0x0D || in[i] == 0x9b)
+            in[i] = 0x00;
+    }
+
+    // Unlike JSON, a CSS selector can contain colons (e.g. div:first-child), so
+    // only strip a leading "N:"/"N#:" device prefix rather than splitting on a colon.
+    std::string inp_string(reinterpret_cast<char*>(in));
+    if (inp_string.size() >= 2 && (inp_string[0] == 'N' || inp_string[0] == 'n'))
+    {
+        size_t p = 1;
+        if (p < inp_string.size() && inp_string[p] >= '0' && inp_string[p] <= '9')
+            p++;
+        if (p < inp_string.size() && inp_string[p] == ':')
+            inp_string.erase(0, p + 1);
+    }
+
+    sgml->setReadQuery(inp_string, packet.param(1));
+    int query_bytes = sgml->available();
+    sgml_bytes_remaining += query_bytes;
+
+    std::vector<uint8_t> tmp(query_bytes);
+    sgml->readValue(tmp.data(), query_bytes);
+
+    // don't copy past first nul char in tmp
+    auto null_pos = std::find(tmp.begin(), tmp.end(), 0);
+    *receiveBuffer += std::string(tmp.begin(), null_pos);
+
+    Debug_printf("SGML query set to >%s< (buf_size=%d, sgml_remaining=%d)\r\n",
+                 inp_string.c_str(), (int)receiveBuffer->size(), sgml_bytes_remaining);
+    SYSTEM_BUS.transaction_success();
+}
+
 void sioNetwork::sio_set_json_parameters(const FujiSIOPacket &packet)
 {
     SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
@@ -1312,12 +1368,11 @@ void sioNetwork::process_fs(const FujiSIOPacket &packet)
     }
 
     // Make sure this is really a FS protocol instance
-    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol);
+    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol.get());
     if (!fs)
     {
         SYSTEM_BUS.transaction_error(); // ACK already sent; host expects C or E, not N
-        delete protocol;
-        protocol = nullptr;
+        protocol.reset();
         return;
     }
 
@@ -1325,39 +1380,32 @@ void sioNetwork::process_fs(const FujiSIOPacket &packet)
     auto url = urlParser.get();
     switch (packet.command())
     {
-    case NETCMD_RENAME:
+    case CMD::NET_RENAME:
         err = fs->rename(url);
         break;
-    case NETCMD_DELETE:
+    case CMD::NET_DELETE:
         err = fs->del(url);
         break;
-    case NETCMD_LOCK:
+    case CMD::NET_LOCK:
         err = fs->lock(url);
         break;
-    case NETCMD_UNLOCK:
+    case CMD::NET_UNLOCK:
         err = fs->unlock(url);
         break;
-    case NETCMD_MKDIR:
+    case CMD::NET_MKDIR:
         err = fs->mkdir(url);
         break;
-    case NETCMD_RMDIR:
+    case CMD::NET_RMDIR:
         err = fs->rmdir(url);
         break;
     default:
         SYSTEM_BUS.transaction_error(); // ACK already sent; host expects C or E, not N
-        delete protocol;
-        protocol = nullptr;
+        protocol.reset();
         return;
     }
 
     // Clean up the one-shot protocol created for this fs operation
-    delete protocol;
-    protocol = nullptr;
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
-    }
+    protocol.reset();
 
     if (err != FUJI_ERROR::NONE)
     {
@@ -1371,7 +1419,7 @@ void sioNetwork::process_fs(const FujiSIOPacket &packet)
 void sioNetwork::process_tcp(const FujiSIOPacket &packet)
 {
     // Make sure this is really a TCP protocol instance
-    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol);
+    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol.get());
     if (!tcp)
     {
         SYSTEM_BUS.transaction_error();
@@ -1381,11 +1429,11 @@ void sioNetwork::process_tcp(const FujiSIOPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_CONTROL:
+    case CMD::NET_CONTROL:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = tcp->accept_connection();
         break;
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CLOSE_CLIENT:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = tcp->close_client_connection();
         break;
@@ -1406,7 +1454,7 @@ void sioNetwork::process_tcp(const FujiSIOPacket &packet)
 void sioNetwork::process_http(const FujiSIOPacket &packet)
 {
     // Make sure this is really an HTTP protocol instance
-    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol);
+    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol.get());
     if (!http)
     {
         SYSTEM_BUS.transaction_error();
@@ -1416,7 +1464,7 @@ void sioNetwork::process_http(const FujiSIOPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = http->set_channel_mode((netProtoHTTPChannelMode_t) packet.param8(1));
         break;
@@ -1437,7 +1485,7 @@ void sioNetwork::process_http(const FujiSIOPacket &packet)
 void sioNetwork::process_udp(const FujiSIOPacket &packet)
 {
     // Make sure this is really a UDP protocol instance
-    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol);
+    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol.get());
     if (!udp)
     {
         SYSTEM_BUS.transaction_error();
@@ -1448,13 +1496,13 @@ void sioNetwork::process_udp(const FujiSIOPacket &packet)
     switch (packet.command())
     {
 #ifndef ESP_PLATFORM
-    case NETCMD_GET_REMOTE:
+    case CMD::NET_GET_REMOTE:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = udp->get_remote(receiveBuffer->data(), SPECIAL_BUFFER_SIZE);
         SYSTEM_BUS.transaction_send((uint8_t *)receiveBuffer->data(), SPECIAL_BUFFER_SIZE, err != FUJI_ERROR::NONE);
         break;
 #endif /* ESP_PLATFORM */
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_SET_DESTINATION:
         {
             uint8_t spData[SPECIAL_BUFFER_SIZE];
             SYSTEM_BUS.transaction_get(spData, sizeof(spData));

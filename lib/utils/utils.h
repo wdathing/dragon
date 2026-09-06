@@ -83,6 +83,7 @@ std::string util_remove_spaces(const std::string &s);
 
 void util_strip_nonascii(std::string &s);
 void util_devicespec_fix_9b(uint8_t* buf, unsigned short len);
+std::string util_remove_n_prefix(std::string url);
 std::string util_devicespec_fix_for_parsing(std::string deviceSpec, std::string prefix, bool is_directory_read, bool process_fs_dot);
 
 void clean_transform_petscii_to_ascii(std::string& data);
@@ -119,6 +120,12 @@ bool isApproximatelyInteger(double value, double tolerance = 1e-6);
 
 // ensure string starts with a "/"
 std::string prependSlash(const std::string& str);
+
+// percent-encode for a URL query value (space -> '+')
+std::string util_url_encode(const std::string &s);
+
+// escape for HTML text or a double-quoted attribute value
+std::string util_html_escape(const std::string &s);
 
 #ifndef ESP_PLATFORM
 // helper function for Debug_print* macros on fujinet-pc

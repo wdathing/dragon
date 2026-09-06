@@ -6,23 +6,10 @@
 
 #include "network.h"
 #include "../network.h"
-#include "fuji_endian.h"
-
-#include <cstring>
-#include <algorithm>
-
-#include "../../include/debug.h"
-#include "../../include/pinmap.h"
-
+#include "NetworkProtocolFactory.h"
 #include "fnSystem.h"
 #include "utils.h"
-
-#include "status_error_codes.h"
-#include "Protocol.h"
-#include "TCP.h"
-#include "UDP.h"
-#include "HTTP.h"
-#include "FS.h"
+#include "debug.h"
 
 using namespace std;
 
@@ -57,7 +44,7 @@ drivewireNetwork::~drivewireNetwork()
     specialBuffer = nullptr;
 
     if (protocol != nullptr)
-        delete protocol;
+        protocol.reset();
 
     protocol = nullptr;
 }
@@ -94,14 +81,7 @@ void drivewireNetwork::open(fileAccessMode_t access, netProtoTranslation_t trans
     if (protocol != nullptr)
     {
         protocol->close();
-        delete protocol;
-        protocol = nullptr;
-    }
-
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
+        protocol.reset();
     }
 
     // Parse and instantiate protocol
@@ -110,11 +90,6 @@ void drivewireNetwork::open(fileAccessMode_t access, netProtoTranslation_t trans
     if (protocol == nullptr)
     {
         // invalid devicespec error already passed in.
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
         SYSTEM_BUS.transaction_error();
         return;
     }
@@ -130,13 +105,7 @@ void drivewireNetwork::open(fileAccessMode_t access, netProtoTranslation_t trans
     {
         _errorCode = protocol->error;
         Debug_printf("Protocol unable to make connection. Error: %d\n", _errorCode);
-        delete protocol;
-        protocol = nullptr;
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
+        protocol.reset();
         SYSTEM_BUS.transaction_error();
         return;
     }
@@ -144,7 +113,11 @@ void drivewireNetwork::open(fileAccessMode_t access, netProtoTranslation_t trans
     // TODO: Finally, go ahead and let the parsers know
     json = new FNJSON();
     json->setLineEnding("\x0a");
-    json->setProtocol(protocol);
+    json->setProtocol(protocol.get());
+    sgml = new FNSGML();
+    sgml->setLineEnding("\x0a");
+    sgml->setProtocol(protocol.get());
+    sgml_bytes_remaining = 0; // reset per-open so a prior session's count doesn't leak
     channelMode = PROTOCOL;
 
     SYSTEM_BUS.transaction_success();
@@ -160,32 +133,34 @@ void drivewireNetwork::close()
 
     SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
 
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
-    }
-
     // If no protocol enabled, we just signal complete, and return.
     if (protocol == nullptr)
     {
+        SYSTEM_BUS.transaction_success();
         return;
     }
 
-    // Ask the protocol to close
-    protocol->close();
+    // Ask the protocol to close. Latch its error so the STATUS that follows a
+    // failed commit-on-close (e.g. a calendar compose) can still report it.
+    if (protocol->close() != FUJI_ERROR::NONE)
+        _errorCode = protocol->error;
 
 #ifdef ESP_PLATFORM
     Debug_printv("Before protocol delete %lu\n",esp_get_free_internal_heap_size());
 #endif
     // Delete the protocol object
-    delete protocol;
-    protocol = nullptr;
+    protocol.reset();
 
     if (json != nullptr)
     {
         delete json;
         json = nullptr;
+    }
+
+    if (sgml != nullptr)
+    {
+        delete sgml;
+        sgml = nullptr;
     }
 
 #ifdef ESP_PLATFORM
@@ -228,21 +203,15 @@ void drivewireNetwork::read(uint16_t num_bytes)
     // If protocol isn't connected, then return not connected.
     if (protocol == nullptr)
     {
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
-
         SYSTEM_BUS.transaction_error();
         _errorCode = NDEV_STATUS::NOT_CONNECTED;
         return;
     }
 
     // Do the channel read
-    read_channel(num_bytes);
+    fujiError_t err = read_channel(num_bytes);
 
-    SYSTEM_BUS.transaction_send(*receiveBuffer);
+    SYSTEM_BUS.transaction_send((uint8_t *)receiveBuffer->data(), num_bytes, err != FUJI_ERROR::NONE);
 
     // Remove from receive buffer and shrink.
     receiveBuffer->erase(0, num_bytes);
@@ -264,6 +233,20 @@ fujiError_t drivewireNetwork::read_channel_json(unsigned short num_bytes)
 }
 
 /**
+ * @brief Perform read of the current SGML channel
+ * @param num_bytes Number of bytes to read
+ */
+fujiError_t drivewireNetwork::read_channel_sgml(unsigned short num_bytes)
+{
+    if (num_bytes > sgml_bytes_remaining)
+        sgml_bytes_remaining = 0;
+    else
+        sgml_bytes_remaining -= num_bytes;
+
+    return FUJI_ERROR::NONE;
+}
+
+/**
  * Perform the channel read based on the channelMode
  * @param num_bytes - number of bytes to read from channel.
  * @return FUJI_ERROR::UNSPECIFIED on error, FUJI_ERROR::NONE on success. Passed directly to bus_to_computer().
@@ -279,6 +262,9 @@ fujiError_t drivewireNetwork::read_channel(unsigned short num_bytes)
         break;
     case JSON:
         err = read_channel_json(num_bytes);
+        break;
+    case SGML:
+        err = read_channel_sgml(num_bytes);
         break;
     }
     return err;
@@ -324,11 +310,6 @@ void drivewireNetwork::write(uint16_t num_bytes)
     // If protocol isn't connected, then return not connected.
     if (protocol == nullptr)
     {
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
         SYSTEM_BUS.transaction_error();
         _errorCode = NDEV_STATUS::NOT_CONNECTED;
         return;
@@ -363,6 +344,10 @@ fujiError_t drivewireNetwork::write_channel(unsigned short num_bytes)
         Debug_printf("JSON Not Handled.\n");
         err = FUJI_ERROR::UNSPECIFIED;
         break;
+    case SGML:
+        Debug_printf("SGML Not Handled.\n");
+        err = FUJI_ERROR::UNSPECIFIED;
+        break;
     }
     return err;
 }
@@ -374,6 +359,8 @@ fujiError_t drivewireNetwork::write_channel(unsigned short num_bytes)
  */
 void drivewireNetwork::status(uint8_t mode)
 {
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+
     if (protocol == nullptr)
         status_local(mode);
     else
@@ -434,6 +421,13 @@ bool drivewireNetwork::status_channel_json(NetworkStatus *ns)
     return false; // for now
 }
 
+bool drivewireNetwork::status_channel_sgml(NetworkStatus *ns)
+{
+    ns->connected = sgml_bytes_remaining > 0;
+    ns->error = sgml_bytes_remaining > 0 ? NDEV_STATUS::SUCCESS : NDEV_STATUS::END_OF_FILE;
+    return false; // for now
+}
+
 /**
  * @brief perform channel status commands, if there is a protocol bound.
  */
@@ -446,8 +440,6 @@ void drivewireNetwork::status_channel()
 #ifdef TOO_MUCH_DEBUG
     Debug_printf("drivewireNetwork::status_channel(%u)\n", channelMode);
 #endif /* TOO_MUCH_DEBUG */
-
-    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
 
     switch (channelMode)
     {
@@ -463,6 +455,10 @@ void drivewireNetwork::status_channel()
     case JSON:
         status_channel_json(&ns);
         avail = json_bytes_remaining;
+        break;
+    case SGML:
+        status_channel_sgml(&ns);
+        avail = sgml_bytes_remaining;
         break;
     }
 
@@ -488,6 +484,7 @@ void drivewireNetwork::get_prefix()
     Debug_printf("drivewireNetwork::get_prefix(%s)\n",prefix.c_str());
     memset(out,0,sizeof(out));
     strcpy(out,prefix.c_str());
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     SYSTEM_BUS.transaction_send(out, sizeof(out));
 }
 
@@ -582,6 +579,9 @@ void drivewireNetwork::set_channel_mode(uint8_t mode)
     case 1:
         channelMode = JSON;
         break;
+    case 2:
+        channelMode = SGML;
+        break;
     default:
         break;
     }
@@ -639,12 +639,7 @@ void drivewireNetwork::set_password()
  */
 bool drivewireNetwork::instantiate_protocol()
 {
-    if (!protocolParser)
-    {
-        protocolParser = new ProtocolParser();
-    }
-
-    protocol = protocolParser->createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
+    protocol = NetworkProtocolFactory::createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
 
     if (protocol == nullptr)
     {
@@ -692,8 +687,7 @@ void drivewireNetwork::create_devicespec(bool is_dir)
 */
 void drivewireNetwork::create_url_parser()
 {
-    std::string url = deviceSpec.substr(deviceSpec.find(":") + 1);
-    urlParser = PeoplesUrlParser::parseURL(url);
+    urlParser = PeoplesUrlParser::parseURL(deviceSpec);
 }
 
 void drivewireNetwork::parse_and_instantiate_protocol(bool is_dir)
@@ -800,73 +794,141 @@ void drivewireNetwork::json_query()
     SYSTEM_BUS.transaction_success();
 }
 
+void drivewireNetwork::parse_sgml()
+{
+    sgml->parse();
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    _errorCode = NDEV_STATUS::SUCCESS;
+    SYSTEM_BUS.transaction_success();
+}
+
+void drivewireNetwork::sgml_query()
+{
+    std::string in_string;
+    char tmpq[256];
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+
+    if (SYSTEM_BUS.transaction_get(tmpq, sizeof(tmpq)).is_error())
+    {
+        Debug_printf("Short read. Exiting\n");
+        SYSTEM_BUS.transaction_error();
+        return;
+    }
+
+    in_string = std::string(tmpq);
+
+    // strip away line endings from input spec.
+    for (int i = 0; i < in_string.size(); i++)
+    {
+        unsigned char currentChar = static_cast<unsigned char>(in_string[i]);
+        if (currentChar == 0x0A || currentChar == 0x0D || currentChar == 0x9b)
+        {
+            in_string.resize(i);
+            break;
+        }
+    }
+
+    // Unlike JSON, a CSS selector can contain colons (e.g. div:first-child), so
+    // only strip a leading "N:"/"N#:" device prefix rather than splitting on a colon.
+    if (in_string.size() >= 2 && (in_string[0] == 'N' || in_string[0] == 'n'))
+    {
+        size_t p = 1;
+        if (p < in_string.size() && in_string[p] >= '0' && in_string[p] <= '9')
+            p++;
+        if (p < in_string.size() && in_string[p] == ':')
+            in_string.erase(0, p + 1);
+    }
+
+    sgml->setReadQuery(in_string, 0);
+    int query_bytes = sgml->available();
+    sgml_bytes_remaining += query_bytes;
+
+    std::vector<uint8_t> tmp(query_bytes);
+    sgml->readValue(tmp.data(), query_bytes);
+
+    // don't copy past first nul char in tmp
+    auto null_pos = std::find(tmp.begin(), tmp.end(), 0);
+    *receiveBuffer += std::string(tmp.begin(), null_pos);
+
+    Debug_printf("SGML query set to >%s<\r\n", in_string.c_str());
+    SYSTEM_BUS.transaction_success();
+}
+
 bool drivewireNetwork::processCommand(const FujiDWPacket &packet)
 {
     Debug_printf("comnd: '%c' %u\n", packet.command(), packet.command());
 
     switch (packet.command())
     {
-    case NETCMD_OPEN:
+    case CMD::NET_OPEN:
         open(static_cast<fileAccessMode_t>(packet.param8(0)),
              static_cast<netProtoTranslation_t>(packet.param8(1)));
         break;
-    case NETCMD_CLOSE:
+    case CMD::NET_CLOSE:
         close();
         break;
-    case NETCMD_READ:
+    case CMD::NET_READ:
         read(packet.param(0));
         break;
-    case NETCMD_WRITE:
+    case CMD::NET_WRITE:
         write(packet.param(0));
         break;
-    case NETCMD_STATUS:
+    case CMD::NET_STATUS:
         status(packet.param(1));
         break;
 
-    case NETCMD_PARSE:
-        parse_json();
+    case CMD::NET_PARSE:
+        if (channelMode == SGML)
+            parse_sgml();
+        else
+            parse_json();
         break;
-    case NETCMD_CHANNEL_MODE:
+    case CMD::NET_CHANNEL_MODE:
         set_channel_mode(packet.param(0));
         break;
 
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         get_prefix();
         break;
 
-    case NETCMD_CHDIR:
+    case CMD::NET_CHDIR:
         set_prefix();
         break;
-    case NETCMD_QUERY:
-        json_query();
+    case CMD::NET_QUERY:
+        if (channelMode == SGML)
+            sgml_query();
+        else
+            json_query();
         break;
-    case NETCMD_USERNAME:
+    case CMD::NET_USERNAME:
         set_login();
         break;
-    case NETCMD_PASSWORD:
+    case CMD::NET_PASSWORD:
         set_password();
         break;
 
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
         process_fs(packet);
         break;
 
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
         process_tcp(packet);
         break;
 
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         process_http(packet);
         break;
 
-    case NETCMD_GET_REMOTE:
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_GET_REMOTE:
+    case CMD::NET_SET_DESTINATION:
         process_udp(packet);
         break;
 
@@ -880,11 +942,27 @@ bool drivewireNetwork::processCommand(const FujiDWPacket &packet)
 
 void drivewireNetwork::process_fs(const FujiDWPacket &packet)
 {
-    parse_and_instantiate_protocol(static_cast<fileAccessMode_t>(packet.param8(0))
-                                   == ACCESS_MODE::DIRECTORY);
+    char tmp[256];
+    bool is_dir;
+
+    // Params must be read before the payload; the packet fills from the stream on demand.
+    is_dir = static_cast<fileAccessMode_t>(packet.param8(0)) == ACCESS_MODE::DIRECTORY;
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+    if (SYSTEM_BUS.transaction_get(tmp, sizeof(tmp)).is_error())
+    {
+        Debug_printf("Short read. Exiting.");
+        SYSTEM_BUS.transaction_error();
+        return;
+    }
+
+    tmp[sizeof(tmp)-1] = '\0';
+    deviceSpec = std::string(tmp);
+
+    parse_and_instantiate_protocol(is_dir);
 
     // Make sure this is really a FS protocol instance
-    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol);
+    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol.get());
     if (!fs)
     {
         SYSTEM_BUS.transaction_error();
@@ -895,22 +973,22 @@ void drivewireNetwork::process_fs(const FujiDWPacket &packet)
     auto url = urlParser.get();
     switch (packet.command())
     {
-    case NETCMD_RENAME:
+    case CMD::NET_RENAME:
         err = fs->rename(url);
         break;
-    case NETCMD_DELETE:
+    case CMD::NET_DELETE:
         err = fs->del(url);
         break;
-    case NETCMD_LOCK:
+    case CMD::NET_LOCK:
         err = fs->lock(url);
         break;
-    case NETCMD_UNLOCK:
+    case CMD::NET_UNLOCK:
         err = fs->unlock(url);
         break;
-    case NETCMD_MKDIR:
+    case CMD::NET_MKDIR:
         err = fs->mkdir(url);
         break;
-    case NETCMD_RMDIR:
+    case CMD::NET_RMDIR:
         err = fs->rmdir(url);
         break;
     default:
@@ -921,13 +999,16 @@ void drivewireNetwork::process_fs(const FujiDWPacket &packet)
     if (err != FUJI_ERROR::NONE)
     {
         SYSTEM_BUS.transaction_error();
+        return;
     }
+
+    SYSTEM_BUS.transaction_success();
 }
 
 void drivewireNetwork::process_tcp(const FujiDWPacket &packet)
 {
     // Make sure this is really a TCP protocol instance
-    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol);
+    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol.get());
     if (!tcp)
     {
         SYSTEM_BUS.transaction_error();
@@ -937,10 +1018,10 @@ void drivewireNetwork::process_tcp(const FujiDWPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_CONTROL:
+    case CMD::NET_CONTROL:
         err = tcp->accept_connection();
         break;
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CLOSE_CLIENT:
         err = tcp->close_client_connection();
         break;
     default:
@@ -957,7 +1038,7 @@ void drivewireNetwork::process_tcp(const FujiDWPacket &packet)
 void drivewireNetwork::process_http(const FujiDWPacket &packet)
 {
     // Make sure this is really an HTTP protocol instance
-    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol);
+    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol.get());
     if (!http)
     {
         SYSTEM_BUS.transaction_error();
@@ -969,7 +1050,7 @@ void drivewireNetwork::process_http(const FujiDWPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         err = http->set_channel_mode((netProtoHTTPChannelMode_t) packet.param8(1));
         break;
     default:
@@ -989,7 +1070,7 @@ void drivewireNetwork::process_http(const FujiDWPacket &packet)
 void drivewireNetwork::process_udp(const FujiDWPacket &packet)
 {
     // Make sure this is really a UDP protocol instance
-    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol);
+    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol.get());
     if (!udp)
     {
         SYSTEM_BUS.transaction_error();
@@ -1000,14 +1081,14 @@ void drivewireNetwork::process_udp(const FujiDWPacket &packet)
     switch (packet.command())
     {
 #ifndef ESP_PLATFORM
-    case NETCMD_GET_REMOTE:
+    case CMD::NET_GET_REMOTE:
         receiveBuffer->resize(SPECIAL_BUFFER_SIZE);
         err = udp->get_remote(receiveBuffer->data(), receiveBuffer->size());
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         SYSTEM_BUS.transaction_send(*receiveBuffer);
         break;
 #endif /* ESP_PLATFORM */
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_SET_DESTINATION:
         {
             uint8_t spData[SPECIAL_BUFFER_SIZE];
             SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);

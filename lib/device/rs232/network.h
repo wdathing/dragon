@@ -13,8 +13,7 @@
 #include "status_error_codes.h"
 #include "network_data.h"
 #include "fnjson.h"
-
-#include "ProtocolParser.h"
+#include "fnsgml.h"
 
 /**
  * Number of devices to expose via RS232, becomes 0x71 to 0x70 + NUM_DEVICES - 1
@@ -163,12 +162,7 @@ private:
     /**
      * Instance of currently open network protocol
      */
-    NetworkProtocol *protocol = nullptr;
-
-    /**
-     * @brief Factory that creates protocol from urls
-     */
-    ProtocolParser *protocolParser = nullptr;
+    std::unique_ptr<NetworkProtocol> protocol = nullptr;
 
     /**
      * Network Status object
@@ -256,6 +250,16 @@ private:
     uint16_t json_bytes_remaining = 0;
 
     /**
+     * The fnSGML parser wrapper object (HTML/XML via CSS selector)
+     */
+    FNSGML sgml;
+
+    /**
+     * Bytes remaining of current SGML query result.
+     */
+    uint16_t sgml_bytes_remaining = 0;
+
+    /**
      * Instantiate protocol object
      * @return bool TRUE if protocol successfully called open(), FALSE if protocol could not open
      */
@@ -293,7 +297,7 @@ private:
      *
      * DeviceSpec will be transformed to only contain the relevant part of the deviceSpec, sans comma.
      */
-    void processCommaFromDevicespec(unsigned int dev);
+    void processCommaFromDevicespec(fujiDeviceID_t dev);
 
     /**
      * Perform the correct read based on value of channelMode
@@ -307,6 +311,12 @@ private:
      * @param num_bytes Number of bytes to read
      */
     fujiError_t rs232_read_channel_json(uint16_t num_bytes);
+
+    /**
+     * @brief Perform read of the current SGML channel
+     * @param num_bytes Number of bytes to read
+     */
+    fujiError_t rs232_read_channel_sgml(uint16_t num_bytes);
 
     /**
      * Perform the correct write based on value of channelMode
@@ -332,6 +342,11 @@ private:
     fujiError_t rs232_status_channel_json(NetworkStatus *ns);
 
     /**
+     * @brief get SGML status (# of bytes in receive channel)
+     */
+    fujiError_t rs232_status_channel_sgml(NetworkStatus *ns);
+
+    /**
      * Called to pulse the PROCEED interrupt, rate limited by the interrupt timer.
      */
     void rs232_assert_interrupt();
@@ -355,6 +370,16 @@ private:
      * @brief Set JSON query std::string. (must be in JSON channelMode)
      */
     void rs232_set_json_query();
+
+    /**
+     * @brief Parse incoming SGML/HTML/XML. (must be in SGML channelMode)
+     */
+    void rs232_parse_sgml();
+
+    /**
+     * @brief Set SGML CSS selector query std::string. (must be in SGML channelMode)
+     */
+    void rs232_set_sgml_query();
 
     /**
      * @brief Set timer rate for PROCEED timer in ms

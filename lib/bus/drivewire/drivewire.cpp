@@ -4,7 +4,7 @@
 
 #include "drivewire.h"
 #include "drivewire/drivewireFuji.h"
-#include "drivewire/clock.h"
+#include "drivewire/drivewireClock.h"
 
 #include "../../include/debug.h"
 
@@ -123,7 +123,7 @@ void systemBus::op_reset()
 
     // When a reset transaction occurs, set the mounted disk image to the CONFIG disk image.
     platformFuji.boot_config = true;
-    platformFuji.insert_boot_device(Config.get_general_boot_mode(), MEDIATYPE_UNKNOWN, &platformFuji.bootdisk);
+    platformFuji.insert_boot_device(Config.get_general_boot_mode(), MEDIATYPE_UNKNOWN, platformFuji.FUJI_BOOTDISK);
     if (pNamedObjFp != NULL)
     {
         fclose(pNamedObjFp);
@@ -198,11 +198,7 @@ void systemBus::op_readex()
 
         Debug_printf("OP_READ: DRIVE %3u - SECTOR %8lu\n", drive_num, lsn);
 
-        if (theFuji->boot_config && drive_num == 0)
-            d = &theFuji->bootdisk;
-        else
-            d = &theFuji->get_disk(drive_num)->disk_dev;
-
+        d = &theFuji->get_disk(drive_num)->disk_dev;
         if (!d)
         {
             Debug_printv("Invalid drive #%3u", drive_num);
@@ -356,22 +352,22 @@ bool systemBus::_transaction_handle_command(const FujiDWPacket &packet, virtualD
     _activeFrame = &packet;
 
     if (packet.device() == OP::CLOCK)
-        cmd = FUJICMD_SEND_RESPONSE;
+        cmd = CMD::FUJI_SEND_RESPONSE;
 
     switch (cmd)
     {
-    case FUJICMD_DEVICE_READY:
+    case CMD::FUJI_DEVICE_READY:
         write(0x01); // yes, ready.
         return true;
 
-    case FUJICMD_SEND_ERROR:
+    case CMD::FUJI_SEND_ERROR:
         Debug_printf("drivewire device error = %s\n",
                      device._errorCode == NDEV_STATUS::SUCCESS
                      ? "NONE" : std::to_string(static_cast<int>(device._errorCode)).c_str());
         write(static_cast<uint8_t>(device._errorCode));
         return true;
 
-    case FUJICMD_SEND_RESPONSE:
+    case CMD::FUJI_SEND_RESPONSE:
         len = 0;
         if (packet.device() == OP::NET)
             len = packet.param(0);
@@ -1060,6 +1056,18 @@ void systemBus::transaction_send(const void *data, size_t len, bool is_error)
                                  static_cast<const uint8_t *>(data),
                                  static_cast<const uint8_t *>(data) + len);
     _transaction_state = TRANS_STATE::INVALID;
+}
+
+fujiDeviceID_t systemBus::fujiIDForDevice(drivewireDisk *device)
+{
+    for (uint8_t idx = 0; idx < MAX_DISK_DEVICES; idx++)
+    {
+        auto drv = &theFuji->get_disk(idx)->disk_dev;
+        if (drv == device)
+            return FUJI_DEVICEID::DISK + idx;
+    }
+
+    return (fujiDeviceID_t) 0;
 }
 
 #endif               /* BUILD_COCO */

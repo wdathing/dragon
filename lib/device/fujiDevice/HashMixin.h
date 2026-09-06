@@ -4,9 +4,6 @@
 #include "FujiDeviceMixin.h"
 #include "hash.h"
 
-#ifdef FUJI_MIXINS_ENABLED
-#define FUJI_HASH_MIXIN_ENABLED
-
 class HashMixin : public FujiDeviceMixin
 {
 private:
@@ -27,16 +24,14 @@ protected:
 public:
     HashMixin() {
         handlers = {
-            { FUJICMD_HASH_INPUT,            FM_CMD_HANDLER(hash_input)   },
-            { FUJICMD_HASH_COMPUTE,          FM_CMD_HANDLER(hash_compute) },
-            { FUJICMD_HASH_COMPUTE_NO_CLEAR, FM_CMD_HANDLER(hash_compute) },
-            { FUJICMD_HASH_LENGTH,           FM_CMD_HANDLER(hash_length)  },
-            { FUJICMD_HASH_OUTPUT,           FM_CMD_HANDLER(hash_output)  },
-            { FUJICMD_HASH_CLEAR,            FM_CMD_HANDLER(hash_clear)   },
+            { CMD::FUJI_HASH_INPUT,            FM_CMD_HANDLER(hash_input)   },
+            { CMD::FUJI_HASH_COMPUTE,          FM_CMD_HANDLER(hash_compute) },
+            { CMD::FUJI_HASH_COMPUTE_NO_CLEAR, FM_CMD_HANDLER(hash_compute) },
+            { CMD::FUJI_HASH_LENGTH,           FM_CMD_HANDLER(hash_length)  },
+            { CMD::FUJI_HASH_OUTPUT,           FM_CMD_HANDLER(hash_output)  },
+            { CMD::FUJI_HASH_CLEAR,            FM_CMD_HANDLER(hash_clear)   },
         };
     }
 };
-
-#endif // FUJI_MIXINS_ENABLED
 
 #endif /* HASHMIXIN_H */

@@ -880,6 +880,35 @@ void clean_transform_petscii_to_ascii(std::string& data) {
     data = mstr::toUTF8(data);
 }
 
+static bool util_has_N_prefix(const std::string &url)
+{
+    std::string unit = url.substr(0, url.find_first_of(":") + 1);
+
+    // Must start with 'N' and end with ':'
+    if (unit.size() < 2 || (unit.front() != 'N' && unit.front() != 'n') || unit.back() != ':')
+        return false;
+
+    // If it's exactly "N:", it's a valid match
+    if (unit.size() == 2)
+        return true;
+
+    // For "N[0-9]+:", ensure all middle characters are digits
+    for (size_t idx = 1; idx < unit.size() - 1; idx++)
+    {
+        if (!std::isdigit(static_cast<unsigned char>(unit[idx])))
+            return false;
+    }
+
+    return true;
+}
+
+std::string util_remove_n_prefix(std::string url)
+{
+    if (util_has_N_prefix(url))
+        url = url.substr(url.find_first_of(":") + 1);
+    return url;
+}
+
 // Non-mutating
 std::string util_devicespec_fix_for_parsing(std::string deviceSpec, std::string prefix, bool is_directory_read, bool process_fs_dot)
 {
@@ -888,11 +917,13 @@ std::string util_devicespec_fix_for_parsing(std::string deviceSpec, std::string 
         return "";
     }
 
-    string unit = deviceSpec.substr(0, deviceSpec.find_first_of(":") + 1);
-    string path = deviceSpec.substr(unit.length());
+    // Delete the N: prefix if it is still there, the N: device unit
+    // number has already been determined
+    deviceSpec = util_remove_n_prefix(deviceSpec);
 
+    // FIXME - prefix should go between the host part and the path part
     // if prefix is empty, the concatenation is still valid
-    deviceSpec = unit + prefix + path;
+    deviceSpec = prefix + deviceSpec;
 
 #ifdef VERBOSE_PROTOCOL
     Debug_printf("util_devicespec_fix_for_parsing, spec: >%s<, prefix: >%s<, dir_read?: %s, fs_dot?: %s)\n", deviceSpec.c_str(), prefix.c_str(), is_directory_read ? "true" : "false", process_fs_dot ? "true" : "false");
@@ -1256,6 +1287,55 @@ std::string prependSlash(const std::string& str) {
         return "/" + str;
     }
     return str;
+}
+
+/* Percent-encode a string for use in a URL query value.
+   Spaces become '+', matching the decoder used by the web server's query parser.
+*/
+std::string util_url_encode(const std::string &s)
+{
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(s.length());
+
+    for (unsigned char c : s)
+    {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            out += (char)c;
+        else if (c == ' ')
+            out += '+';
+        else
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+
+    return out;
+}
+
+/* Escape a string for inclusion in HTML text or a double-quoted attribute value.
+*/
+std::string util_html_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.length());
+
+    for (char c : s)
+    {
+        switch (c)
+        {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&#39;"; break;
+        default: out += c; break;
+        }
+    }
+
+    return out;
 }
 
 #ifndef ESP_PLATFORM

@@ -34,6 +34,11 @@ uint8_t sio_checksum(uint8_t *buf, unsigned short len)
     return chk;
 }
 
+fujiDeviceID_t virtualDevice::id()
+{
+    return SYSTEM_BUS.fujiIDForDevice(this);
+}
+
 // SIO NAK
 void systemBus::_sio_nak()
 {
@@ -253,15 +258,15 @@ void systemBus::_sio_process_cmd()
         // reset counter if checksum was correct
         _command_frame_counter = 0;
 #endif
-        if (tmpFrame.device() == FUJI_DEVICEID_DISK && _fujiDev != nullptr && _fujiDev->boot_config)
+        if (tmpFrame.device() == FUJI_DEVICEID::DISK && _fujiDev != nullptr && _fujiDev->boot_config)
         {
-            _activeDev = &_fujiDev->bootdisk;
+            _activeDev = _fujiDev->FUJI_BOOTDISK;
 
             // Boot-priority logic: if enabled, ignore the first few
             // SIO status calls (of the 26 Atari sends) so a real D1:
             // can take over. Once status_waint_count expires, respond
             // normally; if disabled, respond immediately.
-            if (_activeDev->status_wait_count > 0 && tmpFrame.command() == DISKCMD_READ && _fujiDev->status_wait_enabled)
+            if (_activeDev->status_wait_count > 0 && tmpFrame.command() == CMD::DISK_READ && _fujiDev->status_wait_enabled)
             {
                 Debug_printf("Disabling CONFIG boot.\n");
                 _fujiDev->boot_config = false;
@@ -276,15 +281,15 @@ void systemBus::_sio_process_cmd()
         }
         else
         {
-            // Command FUJI_DEVICEID_TYPE3POLL is a Type3 poll - send it to every device that cares
-            if (tmpFrame.device() == FUJI_DEVICEID_TYPE3POLL)
+            // Command FUJI_DEVICEID::TYPE3POLL is a Type3 poll - send it to every device that cares
+            if (tmpFrame.device() == FUJI_DEVICEID::TYPE3POLL)
             {
                 Debug_println("SIO TYPE3 POLL");
                 for (auto devicep : _daisyChain)
                 {
                     if (devicep->listen_to_type3_polls)
                     {
-                        Debug_printf("Sending TYPE3 poll to dev %x\n", devicep->_devnum);
+                        Debug_printf("Sending TYPE3 poll to dev %x\n", devicep->id());
                         _activeDev = devicep;
                         // handle command
                         _activeDev->sio_process(tmpFrame);
@@ -295,15 +300,9 @@ void systemBus::_sio_process_cmd()
             {
                 // find device, ack and pass control
                 // or go back to WAIT
-                for (auto devicep : _daisyChain)
-                {
-                    if (tmpFrame.device() == devicep->_devnum)
-                    {
-                        _activeDev = devicep;
-                        // handle command
-                        _activeDev->sio_process(tmpFrame);
-                    }
-                }
+                _activeDev = _daisyChain.deviceWithFujiID(tmpFrame.device());
+                if (_activeDev)
+                    _activeDev->sio_process(tmpFrame);
             }
         }
     } // valid checksum
@@ -368,6 +367,13 @@ void systemBus::service()
 
     bool is_motor_asserted = false;
     is_motor_asserted = motor_asserted();
+
+    if (_streamDev != nullptr && _streamDev->netstreamActive && !is_motor_asserted
+        && getCurrentBaudrate() != getBaudrate())
+    {
+        Debug_printf("NETSTREAM: MOTOR de-assert, restoring baud %d\n", getBaudrate());
+        setBaudrate(getBaudrate());
+    }
 
     if (_streamDev != nullptr && _streamDev->netstreamActive && is_motor_asserted)
     {
@@ -544,75 +550,36 @@ void systemBus::setup()
 // Add device to SIO bus
 void systemBus::addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id)
 {
-    if (device_id == FUJI_DEVICEID_FUJINET)
+    if (device_id == FUJI_DEVICEID::FUJINET)
     {
         _fujiDev = dynamic_cast<sioFuji*>(pDevice);
     }
-    else if (device_id == FUJI_DEVICEID_SERIAL)
+    else if (device_id == FUJI_DEVICEID::SERIAL)
     {
         _modemDev = (modem *)pDevice;
     }
-    else if (device_id >= FUJI_DEVICEID_NETWORK && device_id <= FUJI_DEVICEID_NETWORK_LAST)
+    else if (device_id >= FUJI_DEVICEID::NETWORK && device_id <= FUJI_DEVICEID::NETWORK_LAST)
     {
-        _netDev[device_id - FUJI_DEVICEID_NETWORK] = (sioNetwork *)pDevice;
+        _netDev[device_id - FUJI_DEVICEID::NETWORK] = (sioNetwork *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_MIDI)
+    else if (device_id == FUJI_DEVICEID::MIDI)
     {
         _streamDev = (sioNetStream *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_CASSETTE)
+    else if (device_id == FUJI_DEVICEID::CASSETTE)
     {
         _cassetteDev = (sioCassette *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_CPM)
+    else if (device_id == FUJI_DEVICEID::CPM)
     {
         _cpmDev = (sioCPM *)pDevice;
     }
-    else if (device_id == FUJI_DEVICEID_PRINTER)
+    else if (device_id == FUJI_DEVICEID::PRINTER)
     {
-        _printerdev = (sioPrinter *)pDevice;
+        _printerDev = (sioPrinter *)pDevice;
     }
 
-    pDevice->_devnum = device_id;
-
-    _daisyChain.push_front(pDevice);
-}
-
-// Removes device from the SIO bus.
-// Note that the destructor is called on the device!
-void systemBus::remDevice(virtualDevice *p)
-{
-    _daisyChain.remove(p);
-}
-
-// Should avoid using this as it requires counting through the list
-int systemBus::numDevices()
-{
-    int i = 0;
-    __BEGIN_IGNORE_UNUSEDVARS
-    for (auto devicep : _daisyChain)
-        i++;
-    return i;
-    __END_IGNORE_UNUSEDVARS
-}
-
-void systemBus::changeDeviceId(virtualDevice *p, int device_id)
-{
-    for (auto devicep : _daisyChain)
-    {
-        if (devicep == p)
-            devicep->_devnum = (fujiDeviceID_t) device_id;
-    }
-}
-
-virtualDevice *systemBus::deviceById(fujiDeviceID_t device_id)
-{
-    for (auto devicep : _daisyChain)
-    {
-        if (devicep->_devnum == device_id)
-            return devicep;
-    }
-    return nullptr;
+    SystemBusBase::addDevice(pDevice, device_id);
 }
 
 // Give devices an opportunity to clean up before a reboot

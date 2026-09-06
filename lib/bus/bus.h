@@ -1,6 +1,7 @@
 #ifndef BUS_H
 #define BUS_H
 
+#include "DaisyChain.h"
 #include "global_types.h"
 
 #include <string>
@@ -30,8 +31,29 @@ class SystemBusBase
 {
 protected:
     transState_t _transaction_state = TRANS_STATE::INVALID;
+    DaisyChain _daisyChain;
 
 public:
+    virtual void addDevice(virtualDevice *device, fujiDeviceID_t deviceType) {
+        _daisyChain.addDevice(device, deviceType);
+    }
+    fujiDeviceID_t fujiIDForDevice(virtualDevice *device) {
+        return _daisyChain.fujiIDForDevice(device).value_or((fujiDeviceID_t) 0);
+    }
+    virtual void assignFujiIDToDevice(virtualDevice *device, fujiDeviceID_t fujiID) {
+        _daisyChain.assignFujiIDToDevice(device, fujiID);
+    }
+    void setDeviceEnabled(fujiDeviceID_t device_id, bool enabled);
+
+    // Rotate the specified devices by the given index offset.
+    // Positive values increase each device's index; negative values decrease it.
+    // Indices wrap around within the supplied device sequence.
+    template <typename T>
+    requires std::derived_from<T, virtualDevice>
+    void rotateDevices(const std::vector<T *> &devices, int amount) {
+        _daisyChain.rotateDevices(devices, amount);
+    }
+
     // Accept the current transaction and perform any protocol-specific setup
     // required before data transfer.
     virtual void transaction_accept(transState_t expectMoreData) = 0;
@@ -78,40 +100,6 @@ public:
     virtual std::string unicodeTextToNative(const std::string &unicode) {
         return unicode;
     }
-};
-
-// Temporary migration wrappers. Remove after all buses have been
-// converted to inherit from SystemBusBase.
-#if defined(BUILD_RS232) \
- || defined(BUILD_COCO) \
- || defined(BUILD_APPLE) \
- || defined(BUILD_ADAM) \
- || defined(BUILD_ATARI) \
- || defined(BUILD_IEC)
-#define NEED_VDEV_MIGRATION
-#else
-#undef NEED_VDEV_MIGRATION
-#endif
-class VDevMigrationWrapper
-{
-#ifdef NEED_VDEV_MIGRATION
-protected:
-    void transaction_begin(transState_t expectMoreData);
-    void transaction_complete();
-    void transaction_error();
-    success_is_true transaction_get(void *data, size_t len);
-    void transaction_put(const void *data, size_t len, bool is_error=false);
-    inline void transaction_put(std::string data) {
-        transaction_put(data.data(), data.size());
-    }
-    inline void transaction_put(ByteBuffer data) {
-        transaction_put(data.data(), data.size());
-    }
-    void transaction_put(int val) {
-        uint8_t c = val;
-        transaction_put(&c, sizeof(c));
-    }
-#endif
 };
 
 #ifdef BUILD_ATARI

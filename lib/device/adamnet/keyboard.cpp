@@ -22,78 +22,43 @@ adamKeyboard::~adamKeyboard()
     server = nullptr;
 }
 
-void adamKeyboard::adamnet_control_status()
+AdamNetStatus deviceStatus()
 {
-    uint8_t r[6] = {0x81, 0x01, 0x00, 0x00, 0x00, 0x01};
-    SYSTEM_BUS.wait_for_idle();
-    adamnet_send_buffer(r, sizeof(r));
+    AdamNetStatus status;
+
+    status.length = 1;
+    status.devtype = ADAMNET_DEVTYPE::CHAR;
+    status.status = 0;
+
+    return status;
 }
 
 void adamKeyboard::adamnet_control_receive()
 {
     if (!client.connected() && server->hasClient())
     {
-        SYSTEM_BUS.wait_for_idle();
-        adamnet_send(0xC1); // NAK
+        SYSTEM_BUS.sendNakPacket();
         client = server->client();
     }
     else if (!client.connected())
     {
-        SYSTEM_BUS.wait_for_idle();
-        adamnet_send(0xC1); // NAK
-    }
-    else if (!kpQueue.empty())
-    {
-        SYSTEM_BUS.wait_for_idle();
-        adamnet_send(0x91); // ACK
+        SYSTEM_BUS.sendNakPacket();
     }
     else if (client.available() > 0)
     {
-        SYSTEM_BUS.wait_for_idle();
-        adamnet_send(0x91); // ACK
-        kpQueue.push(client.read());
+        SYSTEM_BUS.sendAckPacket();
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+        SYSTEM_BUS.transaction_send(client.read());
     }
     else
     {
-        SYSTEM_BUS.wait_for_idle();
-        adamnet_send(0xC1); // NAK
+        SYSTEM_BUS.sendNakPacket();
     }
-}
-
-void adamKeyboard::adamnet_control_clr()
-{
-    uint8_t r[5] = {0xB1, 0x00, 0x01, 0x00, 0x00};
-
-    r[3] = r[4] = kpQueue.front();
-    adamnet_send_buffer(r, sizeof(r));
-    kpQueue.pop();
 }
 
 void adamKeyboard::adamnet_control_ready()
 {
-    SYSTEM_BUS.wait_for_idle();
-    adamnet_send(0x91); // Ack
-}
-
-void adamKeyboard::adamnet_process(const FujiAdamPacket &packet)
-{
-    switch (packet.type())
-    {
-    case APT::MN_STATUS:
-        adamnet_control_status();
-        break;
-    case APT::MN_RECEIVE:
-        adamnet_control_receive();
-        break;
-    case APT::MN_CLR:
-        adamnet_control_clr();
-        break;
-    case APT::MN_READY:
-        adamnet_control_ready();
-        break;
-    default:
-        break;
-    }
+    SYSTEM_BUS.sendAckPacket();
 }
 
 void adamKeyboard::shutdown()

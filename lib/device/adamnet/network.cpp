@@ -6,21 +6,11 @@
 
 #include "network.h"
 #include "../network.h"
-
-#include <cstring>
-#include <algorithm>
-
-#include "../../include/debug.h"
-
+#include "NetworkProtocolFactory.h"
 #include "utils.h"
-#include "fuji_endian.h"
+#include "debug.h"
 
-#include "status_error_codes.h"
-#include "ProtocolParser.h"
-#include "TCP.h"
-#include "UDP.h"
-#include "HTTP.h"
-#include "FS.h"
+#define MAX_ADAM_PACKET_LEN 1024
 
 using namespace std;
 
@@ -29,8 +19,6 @@ using namespace std;
  */
 adamNetwork::adamNetwork()
 {
-    status_response.length = htole16(1024);
-    status_response.devtype = ADAMNET_DEVTYPE_CHAR;
 #ifndef ESP_PLATFORM
     // BoIP: N: ops block on a remote host; send past the 300us window.
     _pc_no_response_deadline = true;
@@ -47,12 +35,17 @@ adamNetwork::adamNetwork()
     protocol = nullptr;
 
     json.setLineEnding("\x00");
+    sgml.setLineEnding("\x00");
 }
 
 /**
  */
 adamNetwork::~adamNetwork()
 {
+    // First the protocol: ~NetworkProtocol() still touches the buffers below.
+    protocol.reset();
+
+    // Then the buffers we own.
     receiveBuffer->clear();
     transmitBuffer->clear();
     specialBuffer->clear();
@@ -63,11 +56,6 @@ adamNetwork::~adamNetwork()
     receiveBuffer = nullptr;
     transmitBuffer = nullptr;
     specialBuffer = nullptr;
-
-    if (protocol != nullptr)
-        delete protocol;
-
-    protocol = nullptr;
 }
 
 /** ADAM COMMANDS ***************************************************************/
@@ -79,15 +67,12 @@ void adamNetwork::get_error()
 {
     NetworkStatus ns;
 
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     Debug_printf("Get Error\n");
-    adamnet_recv(); // CK
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-    response_len = 1;
 
     if (protocol == nullptr)
     {
-        response[0] = (uint8_t) err_open; // last open failure, if any
+        SYSTEM_BUS.transaction_send((int) err_open);
     }
     else
     {
@@ -95,7 +80,7 @@ void adamNetwork::get_error()
         protocol->fromInterrupt = true;
         protocol->status(&ns);
         protocol->fromInterrupt = false;
-        response[0] = (uint8_t) ns.error;
+        SYSTEM_BUS.transaction_send((int) ns.error);
     }
 }
 /**
@@ -103,44 +88,18 @@ void adamNetwork::get_error()
  * Called in response to 'O' command. Instantiate a protocol, pass URL to it, call its open
  * method. Also set up RX interrupt.
  */
-void adamNetwork::open(unsigned short s)
+void adamNetwork::open(const FujiAdamPacket &packet)
 {
-    uint8_t _aux1 = 0, _aux2 = 0;
-    string d;
-
-    if (s) {
-        _aux1 = adamnet_recv();
-        s--;
-    }
-    if (s) {
-        _aux2 = adamnet_recv();
-        s--;
-    }
-
-    if (s > sizeof(response)) // clamp wire length to buffer
-        s = sizeof(response);
-
-    memset(response, 0, sizeof(response));
-    adamnet_recv_buffer(response, s);
-    adamnet_recv(); // checksum
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    channelMode = PROTOCOL;
+    fileAccessMode_t mode = static_cast<fileAccessMode_t>(packet.param8(0));
+    netProtoTranslation_t trans = static_cast<netProtoTranslation_t>(packet.param8(1));
 
     // Shut down protocol if we are sending another open before we close.
     if (protocol != nullptr)
     {
         protocol->close();
-        delete protocol;
-        protocol = nullptr;
-    }
-
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
+        protocol.reset();
+        json.setProtocol(nullptr);
+        sgml.setProtocol(nullptr);
     }
 
     // Reset status buffer
@@ -149,16 +108,12 @@ void adamNetwork::open(unsigned short s)
     Debug_printf("open()\n");
 
     // Parse and instantiate protocol
-    d = string((char *)response, s);
-    parse_and_instantiate_protocol(d, (fileAccessMode_t) _aux1 == ACCESS_MODE::DIRECTORY);
+    bool is_dir = (fileAccessMode_t) packet.param8(0) == ACCESS_MODE::DIRECTORY;
+    parse_and_instantiate_protocol(packet.dataAsString().value(), is_dir);
 
     if (protocol == nullptr)
     {
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
@@ -169,28 +124,26 @@ void adamNetwork::open(unsigned short s)
     protocol->setDirLongWidth(30);
 
     // Attempt protocol open
-    if (protocol->open(urlParser.get(), (fileAccessMode_t) _aux1, (netProtoTranslation_t) _aux2) != FUJI_ERROR::NONE)
+    if (protocol->open(urlParser.get(), mode, trans) != FUJI_ERROR::NONE)
     {
         statusByte.bits.client_error = true;
         err_open = protocol->error; // keep the reason for get_error()
         Debug_printf("Protocol unable to make connection.\n");
-        delete protocol;
-        protocol = nullptr;
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
+        protocol.reset();
+        json.setProtocol(nullptr);
+        sgml.setProtocol(nullptr);
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
     // Associate channel mode
-    json.setProtocol(protocol);
+    json.setProtocol(protocol.get());
+    sgml.setProtocol(protocol.get());
 
     // Clear response
-    memset(response, 0, sizeof(response));
-    response_len = 0;
     Debug_printf("::open() complete err=%d\n", statusByte.bits.client_error);
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
 /**
@@ -201,19 +154,8 @@ void adamNetwork::close()
 {
     Debug_printf("adamNetwork::close()\n");
 
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
     statusByte.byte = 0x00;
     err_open = NDEV_STATUS::NOT_CONNECTED;
-
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
-    }
 
     // If no protocol enabled, we just signal complete, and return.
     if (protocol == nullptr)
@@ -221,37 +163,17 @@ void adamNetwork::close()
         return;
     }
 
-    // Ask the protocol to close
-    protocol->close();
+    // Ask the protocol to close. Latch its error so the STATUS that follows a
+    // failed commit-on-close (e.g. a calendar compose) can still report it.
+    if (protocol->close() != FUJI_ERROR::NONE)
+        err_open = protocol->error;
 
     // Delete the protocol object
-    delete protocol;
-    protocol = nullptr;
+    protocol.reset();
 
-    memset(response, 0, sizeof(response));
-    response_len = 0;
-}
-
-/**
- * Perform the channel read based on the channelMode
- * @param num_bytes - number of bytes to read from channel.
- * @return FUJI_ERROR::UNSPECIFIED on error, FUJI_ERROR::NONE on success. Passed directly to bus_to_computer().
- */
-fujiError_t adamNetwork::read_channel(unsigned short num_bytes)
-{
-    fujiError_t _err = FUJI_ERROR::NONE;
-
-    switch (channelMode)
-    {
-    case PROTOCOL:
-        _err = protocol->read(num_bytes);
-        break;
-    case JSON:
-        Debug_printf("JSON Not Handled.\n");
-        _err = FUJI_ERROR::UNSPECIFIED;
-        break;
-    }
-    return _err;
+    // Don't leave json/sgml holding a dangling protocol pointer
+    json.setProtocol(nullptr);
+    sgml.setProtocol(nullptr);
 }
 
 /**
@@ -259,23 +181,26 @@ fujiError_t adamNetwork::read_channel(unsigned short num_bytes)
  * Write # of bytes specified by aux1/aux2 from tx_buffer out to ADAM. If protocol is unable to return requested
  * number of bytes, return ERROR.
  */
-void adamNetwork::write(uint16_t num_bytes)
+void adamNetwork::write(const FujiAdamPacket &packet)
 {
-    Debug_printf("!!! WRITE\n");
+    // Nothing open to write to, e.g. a WRITE following a failed OPEN.
+    if ((protocol == nullptr) || (transmitBuffer == nullptr))
+    {
+        statusByte.bits.client_error = true;
+        SYSTEM_BUS.transaction_error();
+        return; // Punch out.
+    }
 
-    if (num_bytes > sizeof(response)) // clamp wire length to buffer
-        num_bytes = sizeof(response);
+    auto data = packet.dataAsString().value();
+    Debug_printf("adamNetwork::write(%u)\n", (unsigned) data.size());
+    *transmitBuffer += data;
 
-    memset(response, 0, sizeof(response));
+    // Surface a protocol failure via status(), not a bus NAK.
+    if (adamnet_write_channel(data.size()) != FUJI_ERROR::NONE)
+        statusByte.bits.client_error = true;
 
-    adamnet_recv_buffer(response, num_bytes);
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    *transmitBuffer += string((char *)response, num_bytes);
-    adamnet_write_channel(num_bytes);
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
 /**
@@ -287,13 +212,21 @@ fujiError_t adamNetwork::adamnet_write_channel(unsigned short num_bytes)
 {
     fujiError_t err_net = FUJI_ERROR::NONE;
 
+    // Caller owns the bus reply, so just report the error here.
+    if (protocol == nullptr)
+        return FUJI_ERROR::UNSPECIFIED;
+
     switch (channelMode)
     {
-    case PROTOCOL:
+    case CHANNEL_MODE::PROTOCOL:
         err_net = protocol->write(num_bytes);
         break;
-    case JSON:
+    case CHANNEL_MODE::JSON:
         Debug_printf("JSON Not Handled.\n");
+        err_net = FUJI_ERROR::UNSPECIFIED;
+        break;
+    case CHANNEL_MODE::SGML:
+        Debug_printf("SGML Not Handled.\n");
         err_net = FUJI_ERROR::UNSPECIFIED;
         break;
     }
@@ -308,37 +241,41 @@ fujiError_t adamNetwork::adamnet_write_channel(unsigned short num_bytes)
 void adamNetwork::status()
 {
     NetworkStatus ns;
-    NDeviceStatus *status = (NDeviceStatus *) response;
-    adamnet_recv(); // CK
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
+    NDeviceStatus status{};
 
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
     if (protocol == nullptr)
     {
-        status->avail = 0;
-        status->conn = 0;
-        status->err = err_open;
-        response_len = sizeof(*status);
-        return;
+        // No protocol: report the reason the last open failed.
+        status.avail = 0;
+        status.conn = 0;
+        status.err = err_open;
     }
-
-    switch (channelMode)
+    else
     {
-    case PROTOCOL:
-        protocol->status(&ns);
-        break;
-    case JSON:
-        // err = json.status(&status);
-        break;
+        switch (channelMode)
+        {
+        case CHANNEL_MODE::PROTOCOL:
+            protocol->status(&ns);
+            break;
+        case CHANNEL_MODE::JSON:
+            // err = json.status(&status);
+            break;
+        case CHANNEL_MODE::SGML:
+            // err = sgml.status(&status);
+            break;
+        }
+
+        size_t avail = protocol->available();
+        avail = avail > 65535 ? 65535 : avail;
+        status.avail = avail;
+        status.conn = ns.connected;
+        status.err = ns.error;
     }
 
-    size_t avail = protocol->available();
-    avail = avail > 65535 ? 65535 : avail;
-    status->avail = avail;
-    status->conn = ns.connected;
-    status->err = ns.error;
-    response_len = sizeof(*status);
-    receiveMode = STATUS;
+    SYSTEM_BUS.transaction_send(&status, sizeof(status));
+
+    Debug_printf("status() - BW: %u C: %u E: %u\n", status.avail, status.conn, status.err);
 }
 
 /**
@@ -346,36 +283,17 @@ void adamNetwork::status()
  */
 void adamNetwork::get_prefix()
 {
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
     Debug_printf("adamNetwork::adamnet_getprefix(%s)\n", prefix.c_str());
-    memcpy(response, prefix.data(), prefix.size());
-    response_len = prefix.size();
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_send(prefix);
 }
 
 /**
  * Set Prefix
  */
-void adamNetwork::set_prefix(unsigned short s)
+void adamNetwork::set_prefix(const FujiAdamPacket &packet)
 {
-    uint8_t prefixSpec[256];
-    string prefixSpec_str;
-
-    if (s > sizeof(prefixSpec)) // clamp wire length to buffer
-        s = sizeof(prefixSpec);
-
-    memset(prefixSpec, 0, sizeof(prefixSpec));
-
-    adamnet_recv_buffer(prefixSpec, s);
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    prefixSpec_str = string((const char *)prefixSpec);
+    auto prefixSpec_str = packet.dataAsString().value();
     prefixSpec_str = prefixSpec_str.substr(prefixSpec_str.find_first_of(":") + 1);
     Debug_printf("adamNetwork::adamnet_set_prefix(%s)\n", prefixSpec_str.c_str());
 
@@ -418,113 +336,83 @@ void adamNetwork::set_prefix(unsigned short s)
 
     Debug_printf("Prefix now: %s\n", prefix.c_str());
 
-    response_len = 0;
-    memset(response, 0, sizeof(response));
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
 /**
  * Set login
  */
-void adamNetwork::set_login(uint16_t s)
+void adamNetwork::set_login(const FujiAdamPacket &packet)
 {
-    uint8_t loginspec[256];
-
-    if (s > sizeof(loginspec)) // clamp wire length to buffer
-        s = sizeof(loginspec);
-
-    memset(loginspec, 0, sizeof(loginspec));
-
-    adamnet_recv_buffer(loginspec, s);
-    adamnet_recv(); // ck
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    login = string((char *)loginspec, s);
+    login = packet.dataAsString().value();
 }
 
 /**
  * Set password
  */
-void adamNetwork::set_password(uint16_t s)
+void adamNetwork::set_password(const FujiAdamPacket &packet)
 {
-    uint8_t passwordspec[256];
-
-    if (s > sizeof(passwordspec)) // clamp wire length to buffer
-        s = sizeof(passwordspec);
-
-    memset(passwordspec, 0, sizeof(passwordspec));
-
-    adamnet_recv_buffer(passwordspec, s);
-    adamnet_recv(); // ck
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    password = string((char *)passwordspec, s);
+    password = packet.dataAsString().value();
 }
 
-void adamNetwork::channel_mode()
+void adamNetwork::channel_mode(const FujiAdamPacket &packet)
 {
-    unsigned char m = adamnet_recv();
-    adamnet_recv(); // CK
-
-    switch (m)
+    channelMode_t mode = static_cast<channelMode_t>(packet.param8(0));
+    switch (mode)
     {
-    case 0:
-        channelMode = PROTOCOL;
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        adamnet_response_ack();
-        break;
-    case 1:
-        channelMode = JSON;
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        adamnet_response_ack();
+    case CHANNEL_MODE::PROTOCOL:
+    case CHANNEL_MODE::JSON:
+    case CHANNEL_MODE::SGML:
+        channelMode = mode;
         break;
     default:
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        adamnet_response_nack();
-        break;
+        SYSTEM_BUS.transaction_error();
+        return;
     }
-
-    Debug_printf("adamNetwork::channel_mode(%u)\n", m);
-    memset(response, 0, sizeof(response));
-    response_len = 0;
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
-void adamNetwork::json_query(unsigned short s)
+void adamNetwork::json_query(const FujiAdamPacket &packet)
 {
-    if (s > sizeof(response)) // clamp wire length to buffer
-        s = sizeof(response);
-
-    memset(response, 0, sizeof(response));
-    response_len = 0;
-
-    adamnet_recv_buffer(response, s);
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    json.setReadQuery(std::string((char *)response, s), 0);
-
-    Debug_printv("adamNetwork::json_query(%s)\n", response);
+    std::string query = packet.dataAsString().value();
+    json.setReadQuery(query, 0);
+    Debug_printv("adamNetwork::json_query(%s)\n", query.c_str());
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
 void adamNetwork::json_parse()
 {
-    adamnet_recv(); // CK
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
     bool ok = json.parse();
     if (protocol != nullptr)
         protocol->error = ok ? NDEV_STATUS::SUCCESS : NDEV_STATUS::COULD_NOT_PARSE_JSON;
-    memset(response, 0, sizeof(response));
-    response_len = 0;
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
 }
 
-void adamNetwork::adamnet_response_status()
+void adamNetwork::sgml_query(const FujiAdamPacket &packet)
 {
+    std::string query = packet.dataAsString().value();
+    sgml.setReadQuery(query, 0);
+    Debug_printv("adamNetwork::json_query(%s)\n", query.c_str());
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
+}
+
+void adamNetwork::sgml_parse()
+{
+    bool ok = sgml.parse();
+    if (protocol != nullptr)
+        protocol->error = ok ? NDEV_STATUS::SUCCESS : NDEV_STATUS::COULD_NOT_PARSE_JSON;
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+    SYSTEM_BUS.transaction_success();
+}
+
+AdamNetStatus adamNetwork::deviceStatus()
+{
+    AdamNetStatus status;
     NetworkStatus s;
 
     if (protocol != nullptr)
@@ -539,91 +427,83 @@ void adamNetwork::adamnet_response_status()
         statusByte.bits.client_error = s.error != NDEV_STATUS::SUCCESS;
     }
 
-    status_response.length = htole16(1026); // max packet size 1026 bytes, maybe larger?
-    status_response.status = statusByte.byte;
+    status.length = MAX_ADAM_PACKET_LEN;
+    status.devtype = ADAMNET_DEVTYPE::CHAR;
+    status.status = statusByte.byte;
 
-    int64_t t = GET_TIMESTAMP() - SYSTEM_BUS.start_time;
-
-    if (t < 300)
-        virtualDevice::adamnet_response_status();
+    return status;
 }
 
-void adamNetwork::adamnet_control_ack()
+void adamNetwork::adamnet_control_send(const FujiAdamPacket &packet)
 {
-}
-
-void adamNetwork::adamnet_control_send()
-{
-    uint16_t pkt_len = adamnet_recv_length(); // receive length
-
-    if (pkt_len == 0) // malformed: would underflow to 0xFFFF below
-        return;
-
-    fujiCommandID_t cmd = (fujiCommandID_t) adamnet_recv();         // receive command
-
-    pkt_len--; // Because we've popped the command off the stack
-
-    switch (cmd)
+    Debug_printf("Network command 0x%02x\n", packet.command());
+    switch (packet.command())
     {
-    case NETCMD_CHDIR:
-        set_prefix(pkt_len);
+    case CMD::NET_CHDIR:
+        set_prefix(packet);
         break;
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         get_prefix();
         break;
-    case NETCMD_GET_ERROR:
+    case CMD::NET_GET_ERROR:
         get_error();
         break;
-    case NETCMD_OPEN:
-        open(pkt_len);
+    case CMD::NET_OPEN:
+        open(packet);
         break;
-    case NETCMD_CLOSE:
+    case CMD::NET_CLOSE:
         close();
         break;
-    case NETCMD_STATUS:
+    case CMD::NET_STATUS:
         status();
         break;
-    case NETCMD_WRITE:
-        write(pkt_len);
+    case CMD::NET_WRITE:
+        write(packet);
         break;
-    case NETCMD_CHANNEL_MODE:
-        channel_mode();
+    case CMD::NET_CHANNEL_MODE:
+        channel_mode(packet);
         break;
-    case NETCMD_USERNAME: // login
-        set_login(pkt_len);
+    case CMD::NET_USERNAME: // login
+        set_login(packet);
         break;
-    case NETCMD_PASSWORD: // password
-        set_password(pkt_len);
-        break;
-
-    case NETCMD_PARSE:
-        json_parse();
-        break;
-    case NETCMD_QUERY:
-        json_query(pkt_len);
+    case CMD::NET_PASSWORD: // password
+        set_password(packet);
         break;
 
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
-        process_fs(cmd, pkt_len);
+    case CMD::NET_PARSE:
+        if (channelMode == CHANNEL_MODE::SGML)
+            sgml_parse();
+        else
+            json_parse();
+        break;
+    case CMD::NET_QUERY:
+        if (channelMode == CHANNEL_MODE::SGML)
+            sgml_query(packet);
+        else
+            json_query(packet);
         break;
 
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
-        process_tcp(cmd);
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
+        process_fs(packet);
         break;
 
-    case NETCMD_SET_CHANNEL_MODE:
-        process_http(cmd);
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
+        process_tcp(packet);
         break;
 
-    case NETCMD_GET_REMOTE:
-    case NETCMD_SET_DESTINATION:
-        process_udp(cmd);
+    case CMD::NET_SET_CHANNEL_MODE:
+        process_http(packet);
+        break;
+
+    case CMD::NET_GET_REMOTE:
+    case CMD::NET_SET_DESTINATION:
+        process_udp(packet);
         break;
 
     default:
@@ -632,158 +512,89 @@ void adamNetwork::adamnet_control_send()
     }
 }
 
-void adamNetwork::adamnet_control_clr()
-{
-    adamnet_response_send();
-
-    if (channelMode == JSON)
-        jsonRecvd = false;
-}
-
-void adamNetwork::adamnet_control_receive_channel_json()
+std::optional<ByteBuffer> adamNetwork::adamnet_control_receive_channel_json()
 {
     NetworkStatus ns;
 
-    if ((protocol == nullptr) || (receiveBuffer == nullptr))
-        return; // Punch out.
-
-    if (jsonRecvd == false)
-    {
-        response_len = json.readValueLen();
-        json.readValue(response, response_len);
-        jsonRecvd = true;
-        adamnet_response_ack();
-    }
-    else
-    {
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        if (response_len > 0)
-            adamnet_response_ack();
-        else
-            adamnet_response_nack();
-    }
+    auto len = json.readValueLen();
+    ByteBuffer buffer(len);
+    json.readValue(buffer.data(), buffer.size());
+    return buffer;
 }
 
-inline void adamNetwork::adamnet_control_receive_channel_protocol()
+std::optional<ByteBuffer> adamNetwork::adamnet_control_receive_channel_sgml()
 {
     NetworkStatus ns;
 
-    if ((protocol == nullptr) || (receiveBuffer == nullptr))
-    {
-        adamnet_response_nack(true);
-        return; // Punch out.
-    }
+    auto len = sgml.readValueLen();
+    ByteBuffer buffer(len);
+    sgml.readValue(buffer.data(), buffer.size());
+    return buffer;
+}
+
+std::optional<ByteBuffer> adamNetwork::adamnet_control_receive_channel_protocol()
+{
+    NetworkStatus ns;
 
     // Get status
     protocol->status(&ns);
+    if (ns.error != NDEV_STATUS::SUCCESS)
+        return std::nullopt;
+
     size_t avail = protocol->available();
-
+    avail = std::min<size_t>(MAX_ADAM_PACKET_LEN, avail);
     if (!avail)
-    {
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        adamnet_response_nack(true);
-        return;
-    }
-    else
-    {
-        SYSTEM_BUS.start_time = GET_TIMESTAMP();
-        adamnet_response_ack(true);
-    }
+        return ByteBuffer();
 
-    // Truncate bytes waiting to response size
-    avail = avail > 1024 ? 1024 : avail;
-    response_len = avail;
+    if (protocol->read(avail) != FUJI_ERROR::NONE) // protocol adapter returned error
+        return std::nullopt;
 
-    if (protocol->read(response_len) != FUJI_ERROR::NONE) // protocol adapter returned error
-    {
-        statusByte.bits.client_error = true;
-        adamnet_response_nack();
-        return;
-    }
-    else // everything ok
-    {
-        statusByte.bits.client_error = 0;
-        statusByte.bits.client_data_available = response_len > 0;
-        memcpy(response, receiveBuffer->data(), response_len);
-        receiveBuffer->erase(0, response_len);
-    }
+    statusByte.bits.client_error = 0;
+    statusByte.bits.client_data_available = avail > 0;
+    ByteBuffer buffer;
+    buffer.assign(receiveBuffer->data(), receiveBuffer->data() + avail);
+    receiveBuffer->erase(0, avail);
+    return buffer;
 }
 
 inline void adamNetwork::adamnet_control_receive()
 {
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-
-    // Data is waiting, go ahead and send it off.
-    if (response_len > 0)
+    if ((protocol == nullptr) || (receiveBuffer == nullptr))
     {
-        adamnet_response_ack();
+        SYSTEM_BUS.transaction_error();
+        return; // Punch out.
+    }
+
+    std::optional<ByteBuffer> buffer;
+    switch (channelMode)
+    {
+    case CHANNEL_MODE::JSON:
+        buffer = adamnet_control_receive_channel_json();
+        break;
+    case CHANNEL_MODE::SGML:
+        buffer = adamnet_control_receive_channel_sgml();
+        break;
+    case CHANNEL_MODE::PROTOCOL:
+        buffer = adamnet_control_receive_channel_protocol();
+        break;
+    default:
+        Debug_printf("INVALID CHANNEL MODE %d\n", channelMode);
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
-    switch (channelMode)
+    if (buffer.has_value())
     {
-    case JSON:
-        adamnet_control_receive_channel_json();
-        break;
-    case PROTOCOL:
-        adamnet_control_receive_channel_protocol();
-        break;
-    }
-}
-
-void adamNetwork::adamnet_response_send()
-{
-    uint8_t c = adamnet_checksum(response, response_len);
-
-    if (response_len)
-    {
-        // response_len can be a full 1024 bytes; on the half-duplex bus that whole
-        // burst echoes back into our own RX and, at rxThreshold=1, storms the shared
-        // UART ISR enough to jitter the outgoing bytes. Coalesce the echo for the
-        // duration of the send (same fix as the disk block stream).
-        SYSTEM_BUS.quiet_rx_for_send(true);
-        adamnet_send(0xB0 | _devnum);
-        adamnet_send_length(response_len);
-        adamnet_send_buffer(response, response_len);
-        adamnet_send(c);
-        SYSTEM_BUS.quiet_rx_for_send(false);
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+        if (buffer->size())
+            SYSTEM_BUS.transaction_send(buffer.value());
+        else
+            SYSTEM_BUS.transaction_success();
     }
     else
-        adamnet_send(0xC0 | _devnum); // NAK!
-
-    memset(response, 0, response_len);
-    response_len = 0;
-}
-
-/**
- * Process incoming ADAM command
- * @param comanddata incoming 4 bytes containing command and aux bytes
- * @param checksum 8 bit checksum
- */
-void adamNetwork::adamnet_process(const FujiAdamPacket &packet)
-{
-    switch (packet.type())
     {
-    case APT::MN_STATUS:
-        adamnet_control_status();
-        break;
-    case APT::MN_ACK:
-        adamnet_control_ack();
-        break;
-    case APT::MN_CLR:
-        adamnet_control_clr();
-        break;
-    case APT::MN_RECEIVE:
-        adamnet_control_receive();
-        break;
-    case APT::MN_SEND:
-        adamnet_control_send();
-        break;
-    case APT::MN_READY:
-        adamnet_control_ready();
-        break;
-    default:
-        break;
+        Debug_printf("No data\n");
+        SYSTEM_BUS.transaction_error();
     }
 }
 
@@ -795,12 +606,7 @@ void adamNetwork::adamnet_process(const FujiAdamPacket &packet)
  */
 bool adamNetwork::instantiate_protocol()
 {
-    if (!protocolParser)
-    {
-        protocolParser = new ProtocolParser();
-    }
-
-    protocol = protocolParser->createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
+    protocol = NetworkProtocolFactory::createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
 
     if (protocol == nullptr)
     {
@@ -827,8 +633,7 @@ void adamNetwork::create_devicespec(string d, bool is_dir)
  */
 void adamNetwork::create_url_parser()
 {
-    std::string url = deviceSpec.substr(deviceSpec.find(":") + 1);
-    urlParser = PeoplesUrlParser::parseURL(url);
+    urlParser = PeoplesUrlParser::parseURL(deviceSpec);
 }
 
 void adamNetwork::parse_and_instantiate_protocol(string d, bool is_dir)
@@ -879,22 +684,12 @@ void adamNetwork::adamnet_set_timer_rate()
     // adamnet_complete();
 }
 
-void adamNetwork::process_fs(fujiCommandID_t cmd, unsigned pkt_len)
+void adamNetwork::process_fs(const FujiAdamPacket &packet)
 {
-    if (pkt_len > sizeof(response)) // clamp wire length to buffer
-        pkt_len = sizeof(response);
-
-    adamnet_recv_buffer(response, pkt_len);
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
-    auto data = string((char *)response, pkt_len);
-    parse_and_instantiate_protocol(data, false);
+    parse_and_instantiate_protocol(packet.dataAsString().value(), false);
 
     // Make sure this is really a FS protocol instance
-    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol);
+    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol.get());
     if (!fs)
     {
         statusByte.bits.client_error = true;
@@ -903,24 +698,24 @@ void adamNetwork::process_fs(fujiCommandID_t cmd, unsigned pkt_len)
 
     fujiError_t cmd_err;
     auto url = urlParser.get();
-    switch (cmd)
+    switch (packet.command())
     {
-    case NETCMD_RENAME:
+    case CMD::NET_RENAME:
         cmd_err = fs->rename(url);
         break;
-    case NETCMD_DELETE:
+    case CMD::NET_DELETE:
         cmd_err = fs->del(url);
         break;
-    case NETCMD_LOCK:
+    case CMD::NET_LOCK:
         cmd_err = fs->lock(url);
         break;
-    case NETCMD_UNLOCK:
+    case CMD::NET_UNLOCK:
         cmd_err = fs->unlock(url);
         break;
-    case NETCMD_MKDIR:
+    case CMD::NET_MKDIR:
         cmd_err = fs->mkdir(url);
         break;
-    case NETCMD_RMDIR:
+    case CMD::NET_RMDIR:
         cmd_err = fs->rmdir(url);
         break;
     default:
@@ -932,15 +727,12 @@ void adamNetwork::process_fs(fujiCommandID_t cmd, unsigned pkt_len)
         statusByte.bits.client_error = true;
 }
 
-void adamNetwork::process_tcp(fujiCommandID_t cmd)
+void adamNetwork::process_tcp(const FujiAdamPacket &packet)
 {
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
     statusByte.byte = 0x00;
 
     // Make sure this is really a TCP protocol instance
-    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol);
+    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol.get());
     if (!tcp)
     {
         statusByte.bits.client_error = true;
@@ -948,14 +740,14 @@ void adamNetwork::process_tcp(fujiCommandID_t cmd)
     }
 
     fujiError_t cmd_err;
-    switch (cmd)
+    switch (packet.command())
     {
-    case NETCMD_CONTROL:
+    case CMD::NET_CONTROL:
         cmd_err = FUJI_ERROR::NONE;
 
         {
             cmd_err = tcp->accept_connection();
-            Debug_printf("ACCEPT %x CHANMODE %d ERR: %d\n", _devnum, channelMode, cmd_err);
+            Debug_printf("ACCEPT %x CHANMODE %d ERR: %d\n", id(), channelMode, cmd_err);
 
             // Because we're not handling Adam bus very well, sometimes it
             // retries and we've already accepted which will return an
@@ -964,7 +756,7 @@ void adamNetwork::process_tcp(fujiCommandID_t cmd)
             statusByte.bits.client_error = false;
         }
         break;
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CLOSE_CLIENT:
         cmd_err = tcp->close_client_connection();
         break;
     default:
@@ -976,18 +768,12 @@ void adamNetwork::process_tcp(fujiCommandID_t cmd)
         statusByte.bits.client_error = true;
 }
 
-void adamNetwork::process_http(fujiCommandID_t cmd)
+void adamNetwork::process_http(const FujiAdamPacket &packet)
 {
-    unsigned char m = adamnet_recv();
-    adamnet_recv(); // CK
-
-    SYSTEM_BUS.start_time = GET_TIMESTAMP();
-    adamnet_response_ack();
-
     statusByte.byte = 0x00;
 
     // Make sure this is really a HTTP protocol instance
-    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol);
+    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol.get());
     if (!http)
     {
         statusByte.bits.client_error = true;
@@ -997,10 +783,10 @@ void adamNetwork::process_http(fujiCommandID_t cmd)
     }
 
     fujiError_t cmd_err;
-    switch (cmd)
+    switch (packet.command())
     {
-    case NETCMD_SET_CHANNEL_MODE:
-        cmd_err = http->set_channel_mode((netProtoHTTPChannelMode_t) m);
+    case CMD::NET_SET_CHANNEL_MODE:
+        cmd_err = http->set_channel_mode((netProtoHTTPChannelMode_t) packet.param8(0));
         break;
     default:
         cmd_err = FUJI_ERROR::UNSPECIFIED;
@@ -1011,12 +797,12 @@ void adamNetwork::process_http(fujiCommandID_t cmd)
         statusByte.bits.client_error = true;
 }
 
-void adamNetwork::process_udp(fujiCommandID_t cmd)
+void adamNetwork::process_udp(const FujiAdamPacket &packet)
 {
     statusByte.byte = 0x00;
 
     // Make sure this is really a UDP protocol instance
-    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol);
+    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol.get());
     if (!udp)
     {
         statusByte.bits.client_error = true;
@@ -1024,24 +810,23 @@ void adamNetwork::process_udp(fujiCommandID_t cmd)
     }
 
     fujiError_t cmd_err;
-    switch (cmd)
+    switch (packet.command())
     {
 #ifndef ESP_PLATFORM
-    case NETCMD_GET_REMOTE:
+    case CMD::NET_GET_REMOTE:
     {
         receiveBuffer->resize(SPECIAL_BUFFER_SIZE);
         cmd_err = udp->get_remote(receiveBuffer->data(), receiveBuffer->size());
-        size_t n = receiveBuffer->size() < sizeof(response) ? receiveBuffer->size() : sizeof(response);
-        memcpy(response, receiveBuffer->data(), n);
-        response_len = n;
+        SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
+        size_t len = std::min<size_t>(MAX_ADAM_PACKET_LEN, receiveBuffer->size());
+        SYSTEM_BUS.transaction_send(receiveBuffer->data(), len);
+        receiveBuffer->erase(0, len);
         break;
     }
 #endif /* ESP_PLATFORM */
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_SET_DESTINATION:
         {
-            uint8_t spData[SPECIAL_BUFFER_SIZE];
-            size_t bytes_read = SYSTEM_BUS.read(spData, sizeof(spData));
-            cmd_err = udp->set_destination(spData, bytes_read);
+            cmd_err = udp->set_destination(packet.data()->data(), packet.data()->size());
             if (cmd_err != FUJI_ERROR::NONE)
                 statusByte.bits.client_error = true;
         }

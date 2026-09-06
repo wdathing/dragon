@@ -13,7 +13,7 @@
 // #include "mac/network.h"
 #include "mac/printer.h"
 // #include "iwm/cpm.h"
-// #include "iwm/clock.h"
+// #include "iwm/iwmClock.h"
 #include "mac/modem.h"
 
 #include "../fuji/fujiHost.h"
@@ -32,7 +32,7 @@ private:
     //uint8_t response[1024]; // use packet_buffer instead
     //uint16_t response_len;
 
-    // Response to FUJICMD_GET_SCAN_RESULT
+    // Response to CMD::FUJI_GET_SCAN_RESULT
     struct
     {
         char ssid[MAX_SSID_LEN + 1];
@@ -192,7 +192,7 @@ extern macFuji *theFuji;
 #include "iwm/network.h"
 #include "iwm/printer.h"
 #include "iwm/cpm.h"
-#include "iwm/clock.h"
+#include "iwm/iwmClock.h"
 #include "iwm/modem.h"
 
 

@@ -6,30 +6,10 @@
 
 #include "network.h"
 #include "../network.h"
-#include "fuji_endian.h"
-#include "fujiCommandID.h"
-
-#include <cstring>
-#include <algorithm>
-
-#include "../../include/debug.h"
-#include "../../include/pinmap.h"
-
+#include "NetworkProtocolFactory.h"
 #include "fnSystem.h"
 #include "utils.h"
-
-#include "status_error_codes.h"
-#include "TCP.h"
-#include "UDP.h"
-#include "Test.h"
-#include "Telnet.h"
-#include "TNFS.h"
-#include "FTP.h"
-#include "HTTP.h"
-#include "SSH.h"
-#include "SMB.h"
-
-#include "ProtocolParser.h"
+#include "debug.h"
 
 #define DEFAULT_LINE_ENDING "\n"
 
@@ -63,6 +43,7 @@ rs232Network::rs232Network()
     specialBuffer->clear();
 
     json.setLineEnding(DEFAULT_LINE_ENDING);
+    sgml.setLineEnding(DEFAULT_LINE_ENDING);
 }
 
 /**
@@ -81,10 +62,7 @@ rs232Network::~rs232Network()
     transmitBuffer = nullptr;
     specialBuffer = nullptr;
 
-    if (protocol != nullptr)
-        delete protocol;
-
-    protocol = nullptr;
+    protocol.reset();
 }
 
 /** RS232 COMMANDS ***************************************************************/
@@ -113,13 +91,7 @@ void rs232Network::rs232_open(fileAccessMode_t access, netProtoTranslation_t tra
     if (protocol != nullptr)
     {
         protocol->close();
-        delete protocol;
-        protocol = nullptr;
-    }
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
+        protocol.reset();
     }
 
     // Reset status buffer
@@ -140,13 +112,7 @@ void rs232Network::rs232_open(fileAccessMode_t access, netProtoTranslation_t tra
     {
         status.error = protocol->error;
         Debug_printf("Protocol unable to make connection. Error: %d\n", (int) status.error);
-        delete protocol;
-        protocol = nullptr;
-        if (protocolParser != nullptr)
-        {
-            delete protocolParser;
-            protocolParser = nullptr;
-        }
+        protocol.reset();
         SYSTEM_BUS.transaction_error();
         return;
     }
@@ -160,8 +126,11 @@ void rs232Network::rs232_open(fileAccessMode_t access, netProtoTranslation_t tra
     rs232_assert_interrupt();
 
     // TODO: Finally, go ahead and let the parsers know
-    json.setProtocol(protocol);
+    json.setProtocol(protocol.get());
     json.setLineEnding(DEFAULT_LINE_ENDING);
+    sgml.setProtocol(protocol.get());
+    sgml.setLineEnding(DEFAULT_LINE_ENDING);
+    sgml_bytes_remaining = 0; // reset per-open so a prior session's count doesn't leak
     protocol->setLineEnding(DEFAULT_LINE_ENDING);
     channelMode = CHANNEL_MODE::PROTOCOL;
 
@@ -181,11 +150,6 @@ void rs232Network::rs232_close()
 
     status.reset();
 
-    if (protocolParser != nullptr)
-    {
-        delete protocolParser;
-        protocolParser = nullptr;
-    }
     // If no protocol enabled, we just signal complete, and return.
     if (protocol == nullptr)
     {
@@ -193,15 +157,18 @@ void rs232Network::rs232_close()
         return;
     }
 
-    // Ask the protocol to close
+    // Ask the protocol to close. Latch its error so the STATUS that follows a
+    // failed commit-on-close (e.g. a calendar compose) can still report it.
     if (protocol->close() != FUJI_ERROR::NONE)
+    {
+        status.error = protocol->error;
         SYSTEM_BUS.transaction_error();
+    }
     else
         SYSTEM_BUS.transaction_success();
 
     // Delete the protocol object
-    delete protocol;
-    protocol = nullptr;
+    protocol.reset();
 }
 
 /**
@@ -258,6 +225,20 @@ fujiError_t rs232Network::rs232_read_channel_json(uint16_t num_bytes)
 }
 
 /**
+ * @brief Perform read of the current SGML channel
+ * @param num_bytes Number of bytes to read
+ */
+fujiError_t rs232Network::rs232_read_channel_sgml(uint16_t num_bytes)
+{
+    if (num_bytes > sgml_bytes_remaining)
+        sgml_bytes_remaining=0;
+    else
+        sgml_bytes_remaining-=num_bytes;
+
+    return FUJI_ERROR::NONE;
+}
+
+/**
  * Perform the channel read based on the channelMode
  * @param num_bytes - number of bytes to read from channel.
  * @return TRUE on error, FALSE on success. Passed directly to SYSTEM_BUS.transaction_send().
@@ -273,6 +254,9 @@ fujiError_t rs232Network::rs232_read_channel(uint16_t num_bytes)
         break;
     case CHANNEL_MODE::JSON:
         err = rs232_read_channel_json(num_bytes);
+        break;
+    case CHANNEL_MODE::SGML:
+        err = rs232_read_channel_sgml(num_bytes);
         break;
     }
     return err;
@@ -344,6 +328,10 @@ fujiError_t rs232Network::rs232_write_channel(uint16_t num_bytes)
         Debug_printf("JSON Not Handled.\n");
         err = FUJI_ERROR::UNSPECIFIED;
         break;
+    case CHANNEL_MODE::SGML:
+        Debug_printf("SGML Not Handled.\n");
+        err = FUJI_ERROR::UNSPECIFIED;
+        break;
     }
     return err;
 }
@@ -413,6 +401,13 @@ fujiError_t rs232Network::rs232_status_channel_json(NetworkStatus *ns)
     return FUJI_ERROR::NONE; // for now
 }
 
+fujiError_t rs232Network::rs232_status_channel_sgml(NetworkStatus *ns)
+{
+    ns->connected = sgml_bytes_remaining > 0;
+    ns->error = sgml_bytes_remaining > 0 ? NDEV_STATUS::SUCCESS : NDEV_STATUS::END_OF_FILE;
+    return FUJI_ERROR::NONE; // for now
+}
+
 /**
  * @brief perform channel status commands, if there is a protocol bound.
  */
@@ -439,6 +434,10 @@ void rs232Network::rs232_status_channel()
     case CHANNEL_MODE::JSON:
         rs232_status_channel_json(&status);
         avail = json_bytes_remaining;
+        break;
+    case CHANNEL_MODE::SGML:
+        rs232_status_channel_sgml(&status);
+        avail = sgml_bytes_remaining;
         break;
     }
 
@@ -561,6 +560,7 @@ void rs232Network::rs232_set_channel_mode(channelMode_t newMode) // was aux2
     {
     case CHANNEL_MODE::PROTOCOL:
     case CHANNEL_MODE::JSON:
+    case CHANNEL_MODE::SGML:
         channelMode = newMode;
         SYSTEM_BUS.transaction_success();
         break;
@@ -602,7 +602,7 @@ void rs232Network::rs232_set_password()
 void rs232Network::process_tcp(const FujiBusPacket &packet)
 {
     // Make sure this is really a TCP protocol instance
-    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol);
+    NetworkProtocolTCP *tcp = dynamic_cast<NetworkProtocolTCP *>(protocol.get());
     if (!tcp)
     {
         SYSTEM_BUS.transaction_error();
@@ -612,11 +612,11 @@ void rs232Network::process_tcp(const FujiBusPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_CONTROL:
+    case CMD::NET_CONTROL:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = tcp->accept_connection();
         break;
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CLOSE_CLIENT:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = tcp->close_client_connection();
         break;
@@ -634,7 +634,7 @@ void rs232Network::process_tcp(const FujiBusPacket &packet)
 void rs232Network::process_http(const FujiBusPacket &packet)
 {
     // Make sure this is really an HTTP protocol instance
-    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol);
+    NetworkProtocolHTTP *http = dynamic_cast<NetworkProtocolHTTP *>(protocol.get());
     if (!http)
     {
         SYSTEM_BUS.transaction_error();
@@ -644,7 +644,7 @@ void rs232Network::process_http(const FujiBusPacket &packet)
     fujiError_t err;
     switch (packet.command())
     {
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = http->set_channel_mode((netProtoHTTPChannelMode_t) packet.param(1));
         break;
@@ -662,7 +662,7 @@ void rs232Network::process_http(const FujiBusPacket &packet)
 void rs232Network::process_udp(const FujiBusPacket &packet)
 {
     // Make sure this is really a UDP protocol instance
-    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol);
+    NetworkProtocolUDP *udp = dynamic_cast<NetworkProtocolUDP *>(protocol.get());
     if (!udp)
     {
         SYSTEM_BUS.transaction_error();
@@ -673,13 +673,13 @@ void rs232Network::process_udp(const FujiBusPacket &packet)
     switch (packet.command())
     {
 #ifndef ESP_PLATFORM
-    case NETCMD_GET_REMOTE:
+    case CMD::NET_GET_REMOTE:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
         err = udp->get_remote(receiveBuffer->data(), SPECIAL_BUFFER_SIZE);
         SYSTEM_BUS.transaction_send((uint8_t *)receiveBuffer->data(), SPECIAL_BUFFER_SIZE, err != FUJI_ERROR::NONE);
         break;
 #endif /* ESP_PLATFORM */
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_SET_DESTINATION:
         {
             uint8_t spData[SPECIAL_BUFFER_SIZE];
             SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
@@ -736,7 +736,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
     switch (packet.command())
     {
     // Channel-based I/O
-    case NETCMD_OPEN:
+    case CMD::NET_OPEN:
         if (packet.paramCount() < 2) {
             Debug_printv("Insufficient open paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -745,10 +745,10 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
             rs232_open((fileAccessMode_t) packet.param(0),
                        (netProtoTranslation_t) packet.param(1));
         break;
-    case NETCMD_CLOSE:
+    case CMD::NET_CLOSE:
         rs232_close();
         break;
-    case NETCMD_READ:
+    case CMD::NET_READ:
         if (packet.paramCount() < 1) {
             Debug_printv("Insufficient read paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -756,7 +756,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
         else
             rs232_read(packet.param(0));
         break;
-    case NETCMD_WRITE:
+    case CMD::NET_WRITE:
         if (packet.paramCount() < 1 || !packet.data().has_value()) {
             Debug_printv("Insufficient write paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -764,7 +764,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
         else
             rs232_write(packet.param(0));
         break;
-    case NETCMD_STATUS:
+    case CMD::NET_STATUS:
         {
             FujiStatusReq reqType = STATUS_NETWORK_CONNERR;
             if (packet.paramCount() >= 2)
@@ -772,14 +772,20 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
             rs232_status(reqType);
         }
         break;
-    case NETCMD_PARSE:
+    case CMD::NET_PARSE:
         SYSTEM_BUS.transaction_accept(TRANS_STATE::NO_GET);
-        rs232_parse_json();
+        if (channelMode == CHANNEL_MODE::SGML)
+            rs232_parse_sgml();
+        else
+            rs232_parse_json();
         break;
-    case NETCMD_QUERY:
-        rs232_set_json_query();
+    case CMD::NET_QUERY:
+        if (channelMode == CHANNEL_MODE::SGML)
+            rs232_set_sgml_query();
+        else
+            rs232_set_json_query();
         break;
-    case NETCMD_CHANNEL_MODE:
+    case CMD::NET_CHANNEL_MODE:
         if (packet.paramCount() < 2) {
             Debug_printv("Insufficient mode paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -790,7 +796,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
             rs232_set_channel_mode((channelMode_t) packet.param(1));
         }
         break;
-    case NETCMD_SEEK:
+    case CMD::NET_SEEK:
         if (packet.paramCount() < 1) {
             Debug_printv("Insufficient seek paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -798,10 +804,10 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
         else
             rs232_seek(packet.param(0));
         break;
-    case NETCMD_TELL:
+    case CMD::NET_TELL:
         rs232_tell();
         break;
-    case NETCMD_TRANSLATION:
+    case CMD::NET_TRANSLATION:
         if (packet.paramCount() < 2) {
             Debug_printv("Insufficient translation paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -809,7 +815,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
         else
             rs232_set_translation((netProtoTranslation_t) packet.param(1));
         break;
-    case NETCMD_SET_EOL:
+    case CMD::NET_SET_EOL:
         if (packet.paramCount() < 1) {
             Debug_printv("Insufficient EOL paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -827,7 +833,7 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
             rs232_set_eol(eol);
         }
         break;
-    case NETCMD_SET_INT_RATE:
+    case CMD::NET_SET_INT_RATE:
         if (packet.paramCount() < 2) {
             Debug_printv("Insufficient rate paramaters: %d", packet.paramCount());
             SYSTEM_BUS.transaction_error();
@@ -835,39 +841,39 @@ void rs232Network::rs232_process(const FujiBusPacket &packet)
         else
             rs232_set_timer_rate(packet.param(1));
         break;
-    case NETCMD_GETCWD:
+    case CMD::NET_GETCWD:
         rs232_get_prefix();
         break;
-    case NETCMD_CHDIR:
+    case CMD::NET_CHDIR:
         rs232_set_prefix();
         break;
-    case NETCMD_USERNAME:
+    case CMD::NET_USERNAME:
         rs232_set_login();
         break;
-    case NETCMD_PASSWORD:
+    case CMD::NET_PASSWORD:
         rs232_set_password();
         break;
 
-    case NETCMD_CONTROL:
-    case NETCMD_CLOSE_CLIENT:
+    case CMD::NET_CONTROL:
+    case CMD::NET_CLOSE_CLIENT:
         process_tcp(packet);
         break;
 
-    case NETCMD_SET_CHANNEL_MODE:
+    case CMD::NET_SET_CHANNEL_MODE:
         process_http(packet);
         break;
 
-    case NETCMD_GET_REMOTE:
-    case NETCMD_SET_DESTINATION:
+    case CMD::NET_GET_REMOTE:
+    case CMD::NET_SET_DESTINATION:
         process_udp(packet);
         break;
 
-    case NETCMD_RENAME:
-    case NETCMD_DELETE:
-    case NETCMD_LOCK:
-    case NETCMD_UNLOCK:
-    case NETCMD_MKDIR:
-    case NETCMD_RMDIR:
+    case CMD::NET_RENAME:
+    case CMD::NET_DELETE:
+    case CMD::NET_LOCK:
+    case CMD::NET_UNLOCK:
+    case CMD::NET_MKDIR:
+    case CMD::NET_RMDIR:
         process_fs(packet);
         break;
 
@@ -911,12 +917,7 @@ void rs232Network::rs232_poll_interrupt()
  */
 success_is_true rs232Network::instantiate_protocol()
 {
-    if (!protocolParser)
-    {
-        protocolParser = new ProtocolParser();
-    }
-
-    protocol = protocolParser->createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
+    protocol = NetworkProtocolFactory::createProtocol(urlParser->scheme, receiveBuffer, transmitBuffer, specialBuffer, &login, &password);
 
     if (protocol == nullptr)
     {
@@ -925,7 +926,7 @@ success_is_true rs232Network::instantiate_protocol()
     }
 
     // Serial/CP-M machines use a CR/LF pair as their native EOL, unless the
-    // client has overridden it with the NETCMD_SET_EOL command.
+    // client has overridden it with the CMD::NET_SET_EOL command.
     protocol->native_eol = native_eol_override.empty() ? STR_ASCII_CRLF : native_eol_override;
 
     Debug_printf("rs232Network::instantiate_protocol() - Protocol %s created.\n", urlParser->scheme.c_str());
@@ -939,6 +940,7 @@ success_is_true rs232Network::instantiate_protocol()
 void rs232Network::create_devicespec(fileAccessMode_t access)
 {
     // Get Devicespec from buffer, and put into primary devicespec string
+    memset(devicespecBuf, 0, sizeof(devicespecBuf));
     SYSTEM_BUS.transaction_get(devicespecBuf, sizeof(devicespecBuf));
     util_devicespec_fix_9b(devicespecBuf, sizeof(devicespecBuf));
     deviceSpec = string((char *)devicespecBuf);
@@ -959,8 +961,7 @@ void rs232Network::create_devicespec(fileAccessMode_t access)
 */
 void rs232Network::create_url_parser()
 {
-    std::string url = deviceSpec.substr(deviceSpec.find(":") + 1);
-    urlParser = PeoplesUrlParser::parseURL(url);
+    urlParser = PeoplesUrlParser::parseURL(deviceSpec);
 }
 
 void rs232Network::parse_and_instantiate_protocol(fileAccessMode_t access)
@@ -1032,7 +1033,7 @@ void rs232Network::timer_stop()
  *
  * DeviceSpec will be transformed to only contain the relevant part of the deviceSpec, sans comma.
  */
-void rs232Network::processCommaFromDevicespec(unsigned int dev)
+void rs232Network::processCommaFromDevicespec(fujiDeviceID_t dev)
 {
     size_t comma_pos = deviceSpec.find(",");
     vector<string> tokens;
@@ -1050,7 +1051,7 @@ void rs232Network::processCommaFromDevicespec(unsigned int dev)
 
         if (item[0] != 'N')
             continue;                                       // not us.
-        else if (item[1] == ':' && dev != FUJI_DEVICEID_NETWORK) // N: but we aren't N1:
+        else if (item[1] == ':' && dev != FUJI_DEVICEID::NETWORK) // N: but we aren't N1:
             continue;                                       // also not us.
         else
         {
@@ -1125,6 +1126,50 @@ void rs232Network::rs232_set_json_query()
     SYSTEM_BUS.transaction_success();
 }
 
+void rs232Network::rs232_parse_sgml()
+{
+    sgml.parse();
+    SYSTEM_BUS.transaction_success();
+}
+
+void rs232Network::rs232_set_sgml_query()
+{
+    uint8_t in[256];
+    uint8_t *tmp;
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+    SYSTEM_BUS.transaction_get(in, sizeof(in));
+
+    // strip away line endings from input spec.
+    for (int i = 0; i < 256; i++)
+    {
+        if (in[i] == 0x0A || in[i] == 0x0D || in[i] == 0x9b)
+            in[i] = 0x00;
+    }
+
+    // Unlike JSON, a CSS selector can contain colons (e.g. div:first-child), so
+    // only strip a leading "N:"/"N#:" device prefix rather than splitting on a colon.
+    std::string inp_string(reinterpret_cast<char*>(in));
+    if (inp_string.size() >= 2 && (inp_string[0] == 'N' || inp_string[0] == 'n'))
+    {
+        size_t p = 1;
+        if (p < inp_string.size() && inp_string[p] >= '0' && inp_string[p] <= '9')
+            p++;
+        if (p < inp_string.size() && inp_string[p] == ':')
+            inp_string.erase(0, p + 1);
+    }
+
+    sgml.setReadQuery(inp_string, 0);
+    int query_bytes = sgml.available();
+    sgml_bytes_remaining += query_bytes;
+    tmp = (uint8_t *)malloc(query_bytes);
+    sgml.readValue(tmp, query_bytes);
+    *receiveBuffer += string((const char *)tmp, query_bytes);
+    free(tmp);
+    Debug_printf("SGML query set to %s\n", inp_string.c_str());
+    SYSTEM_BUS.transaction_success();
+}
+
 void rs232Network::rs232_set_timer_rate(int newRate)
 {
     timerRate = newRate;
@@ -1143,11 +1188,31 @@ void rs232Network::rs232_set_timer_rate(int newRate)
 
 void rs232Network::process_fs(const FujiBusPacket &packet)
 {
+    /* The FS commands are sent without aux bytes, so there may be no
+     * parameter to read. param() throws when the index is absent. */
+    fileAccessMode_t access = static_cast<fileAccessMode_t>(
+        packet.paramCount() > 0 ? packet.param(0) : 0);
+
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+
+    /* The FS commands carry their own devicespec, so this operation gets its
+     * own protocol rather than whatever an earlier open left behind. */
+    if (protocol != nullptr)
+    {
+        protocol->close();
+        protocol.reset();
+    }
+
+    parse_and_instantiate_protocol(access);
+
     // Make sure this is really a FS protocol instance
-    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol);
+    NetworkProtocolFS *fs = dynamic_cast<NetworkProtocolFS *>(protocol.get());
     if (!fs)
     {
-        SYSTEM_BUS.transaction_error();
+        /* protocol is null if parse_and_instantiate_protocol() failed,
+         * and it signalled the error itself. */
+        if (protocol != nullptr)
+            SYSTEM_BUS.transaction_error();
         return;
     }
 
@@ -1155,22 +1220,22 @@ void rs232Network::process_fs(const FujiBusPacket &packet)
     auto url = urlParser.get();
     switch (packet.command())
     {
-    case NETCMD_RENAME:
+    case CMD::NET_RENAME:
         err = fs->rename(url);
         break;
-    case NETCMD_DELETE:
+    case CMD::NET_DELETE:
         err = fs->del(url);
         break;
-    case NETCMD_LOCK:
+    case CMD::NET_LOCK:
         err = fs->lock(url);
         break;
-    case NETCMD_UNLOCK:
+    case CMD::NET_UNLOCK:
         err = fs->unlock(url);
         break;
-    case NETCMD_MKDIR:
+    case CMD::NET_MKDIR:
         err = fs->mkdir(url);
         break;
-    case NETCMD_RMDIR:
+    case CMD::NET_RMDIR:
         err = fs->rmdir(url);
         break;
     default:

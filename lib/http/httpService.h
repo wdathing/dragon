@@ -114,9 +114,8 @@ private:
     static void set_file_content_type(struct mg_connection *c, const char *filepath);
     static void send_file_parsed(struct mg_connection *c, const char *filename);
     static void send_file(struct mg_connection *c, const char *filename);
+    static void send_header_footer(struct mg_connection *c, int headfoot);
     static int redirect_or_result(mg_connection *c, mg_http_message *hm, int result);
-
-    friend class fnHttpServiceBrowser; // allow browser to call above functions
 #endif
 
 public:
@@ -154,6 +153,25 @@ public:
 
     static esp_err_t post_handler_config(httpd_req_t *req);
 
+    // Clipboard
+    static esp_err_t get_handler_clipboard(httpd_req_t *req);
+    static esp_err_t get_handler_clipboard_data(httpd_req_t *req);
+    static esp_err_t post_handler_clipboard(httpd_req_t *req);
+    static esp_err_t post_handler_clipboard_clear(httpd_req_t *req);
+    static esp_err_t post_handler_clipboard_restore(httpd_req_t *req);
+  
+    // Device password management and the session login flow
+    static esp_err_t post_handler_password(httpd_req_t *req);
+    static esp_err_t get_handler_login(httpd_req_t *req);
+    static esp_err_t post_handler_login(httpd_req_t *req);
+    static esp_err_t post_handler_logout(httpd_req_t *req);
+    static esp_err_t get_handler_appkeys(httpd_req_t *req);
+    static esp_err_t post_handler_appkeys(httpd_req_t *req);
+    static esp_err_t get_handler_files(httpd_req_t *req);
+    static esp_err_t get_handler_files_download(httpd_req_t *req);
+    static esp_err_t post_handler_files_action(httpd_req_t *req);
+    static esp_err_t post_handler_files_upload(httpd_req_t *req);
+
     // Google Drive OAuth2 relay-based endpoints
     static esp_err_t get_handler_gdrive_auth(httpd_req_t *req);
     static esp_err_t get_handler_gdrive_poll(httpd_req_t *req);
@@ -162,18 +180,8 @@ public:
     static esp_err_t get_handler_onedrive_auth(httpd_req_t *req);
     static esp_err_t get_handler_onedrive_poll(httpd_req_t *req);
 
-    // REST API handlers
-    static esp_err_t api_handler_status(httpd_req_t *req);
-    static esp_err_t api_handler_drives(httpd_req_t *req);
-    static esp_err_t api_handler_drive_slot(httpd_req_t *req);
-    static esp_err_t api_handler_drive_mount(httpd_req_t *req);
-    static esp_err_t api_handler_drive_eject(httpd_req_t *req);
-    static esp_err_t api_handler_hosts(httpd_req_t *req);
-    static esp_err_t api_handler_host_slot(httpd_req_t *req);
-    static esp_err_t api_handler_printer_status(httpd_req_t *req);
-    static esp_err_t api_handler_printer_clear(httpd_req_t *req);
-    static esp_err_t api_handler_wifi_scan(httpd_req_t *req);
-    static esp_err_t api_handler_wifi_status(httpd_req_t *req);
+    // REST API handler - routing and logic live in httpServiceApi.cpp
+    static esp_err_t api_handler(httpd_req_t *req);
 #else
 // !ESP_PLATFORM
     static int get_handler_print(struct mg_connection *c);
@@ -187,9 +195,31 @@ public:
     static int post_handler_hosts(struct mg_connection *c, struct mg_http_message *hm);
     static int get_handler_eject(mg_connection *c, mg_http_message *hm);
 
+    // Host browsing and drive slot selection
+    static int get_handler_dir(struct mg_connection *c, struct mg_http_message *hm);
+    static int get_handler_slot(struct mg_connection *c, struct mg_http_message *hm);
+    static int get_handler_download(struct mg_connection *c, struct mg_http_message *hm);
+
     static int post_handler_config(struct mg_connection *c, struct mg_http_message *hm);
 
-    static int get_handler_browse(mg_connection *c, mg_http_message *hm);
+    // Clipboard
+    static int get_handler_clipboard(struct mg_connection *c);
+    static int get_handler_clipboard_data(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_clipboard(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_clipboard_clear(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_clipboard_restore(struct mg_connection *c, struct mg_http_message *hm);
+  
+    // Device password management and the session login flow
+    static int post_handler_password(struct mg_connection *c, struct mg_http_message *hm);
+    static int get_handler_login(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_login(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_logout(struct mg_connection *c, struct mg_http_message *hm);
+    static int handler_appkeys(struct mg_connection *c, struct mg_http_message *hm);
+    static int get_handler_files(struct mg_connection *c, struct mg_http_message *hm);
+    static int get_handler_files_download(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_files_action(struct mg_connection *c, struct mg_http_message *hm);
+    static int post_handler_files_upload(struct mg_connection *c, struct mg_http_message *hm);
+
     static int get_handler_shorturl(mg_connection *c, mg_http_message *hm);
 
     // Google Drive OAuth2 relay-based endpoints
@@ -199,6 +229,9 @@ public:
     // OneDrive OAuth2 relay-based endpoints
     static int get_handler_onedrive_auth(struct mg_connection *c, struct mg_http_message *hm);
     static int get_handler_onedrive_poll(struct mg_connection *c, struct mg_http_message *hm);
+
+    // REST API handler - routing and logic live in httpServiceApi.cpp
+    static int api_handler(struct mg_connection *c, struct mg_http_message *hm);
 
     static std::vector<struct mg_connection*> m_sseClients;
     static size_t m_lastOutputSize;

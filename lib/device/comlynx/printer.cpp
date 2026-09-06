@@ -46,8 +46,7 @@ void printerTask(void *param)
             need_print=false;
         }
 
-    vTaskDelay(1);
-
+        fnSystem.yield();
     }
 }
 
@@ -125,7 +124,7 @@ void lynxPrinter::comlynx_control_ready()
 }
 */
 
-void lynxPrinter::comlynx_process()
+void lynxPrinter::comlynx_process(const FujiLynxPacket &packet)
 {
 
 }

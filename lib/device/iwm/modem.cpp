@@ -1373,20 +1373,20 @@ iwm_device_info_block_t iwmModem::create_dib_reply_packet()
 void iwmModem::iwm_open(const iwm_decoded_cmd_t &cmd)
 {
     Debug_printf("\nModem: Open\n");
-    SYSTEM_BUS.transaction_error(SP_ERR::NOERROR);
+    SYSTEM_BUS.transaction_success();
 }
 
 void iwmModem::iwm_close(const iwm_decoded_cmd_t &cmd)
 {
     Debug_printf("\nModem: Close\n");
-    
+
     if (tcpClient.connected() == true)
     {
         tcpClient.flush();
         tcpClient.stop();
     }
-    
-    SYSTEM_BUS.transaction_error(SP_ERR::NOERROR);
+
+    SYSTEM_BUS.transaction_success();
 }
 
 void iwmModem::iwm_read(const iwm_decoded_cmd_t &cmd)
@@ -1436,7 +1436,7 @@ void iwmModem::iwm_write(const iwm_decoded_cmd_t &cmd)
 #endif
     }
 
-    SYSTEM_BUS.transaction_error(SP_ERR::NOERROR);
+    SYSTEM_BUS.transaction_success();
 }
 
 void iwmModem::iwm_ctrl(const iwm_decoded_cmd_t &cmd)
@@ -1465,7 +1465,7 @@ void iwmModem::iwm_status(const iwm_decoded_cmd_t &cmd)
 
     switch (cmd.command())
     {
-    case MODEMCMD_STATUS:
+    case CMD::MODEM_STATUS:
         iwm_modem_status();
         break;
     default:

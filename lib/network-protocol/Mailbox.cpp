@@ -13,6 +13,9 @@
 
 #include "../../include/debug.h"
 #include "status_error_codes.h"
+#include "text_format.h"
+
+using namespace fnfmt;
 
 // The human-readable index/count lines are terminated with `lineEnding`, the
 // per-device end-of-line set by the network.cpp layer (via setLineEnding(),
@@ -22,86 +25,10 @@
 #define MB_DEFAULT_RANGE 20
 // Upper bound on messages fetched for one index, to bound work and memory.
 #define MB_MAX_RANGE 200
+// Upper bound on an accumulated compose/reply draft.
+#define MB_MAX_WRITE 16384
 
-// ─── small string/byte helpers ────────────────────────────────────────────────
-
-namespace {
-
-std::string ellipsize(const std::string &s, int w)
-{
-    if (w <= 0) return "";
-    if ((int)s.size() <= w) return s;
-    if (w <= 3) return s.substr(0, w);
-    return s.substr(0, w - 3) + "...";
-}
-
-std::string ljust(const std::string &s, int w)
-{
-    if ((int)s.size() >= w) return s.substr(0, w);
-    return s + std::string(w - s.size(), ' ');
-}
-
-std::string rjust(const std::string &s, int w)
-{
-    if ((int)s.size() >= w) return s.substr(0, w);
-    return std::string(w - s.size(), ' ') + s;
-}
-
-// Append `n` little-endian bytes of `v`.
-void append_le(std::string &b, uint64_t v, int n)
-{
-    for (int i = 0; i < n; i++)
-    {
-        b += (char)(v & 0xFF);
-        v >>= 8;
-    }
-}
-
-// Append a fixed-width, NUL-terminated, NUL-padded char field.
-void append_fixed(std::string &b, const std::string &s, size_t n)
-{
-    size_t c = (n > 0) ? std::min(s.size(), n - 1) : 0;
-    b.append(s.data(), c);
-    b.append(n - c, '\0');
-}
-
-std::string humanize_date(uint64_t ts)
-{
-    time_t t = (time_t)ts;
-    time_t now = time(nullptr);
-    struct tm tmv;
-    struct tm nowv;
-#if defined(_WIN32)
-    localtime_s(&tmv, &t);
-    localtime_s(&nowv, &now);
-#else
-    localtime_r(&t, &tmv);
-    localtime_r(&now, &nowv);
-#endif
-
-    char buf[16];
-    if (tmv.tm_year == nowv.tm_year)
-        strftime(buf, sizeof(buf), "%d %b", &tmv); // e.g. "31 Jul"
-    else
-        strftime(buf, sizeof(buf), "%m/%d/%y", &tmv); // e.g. "07/31/23"
-    return buf;
-}
-
-std::string humanize_size(uint64_t n)
-{
-    char buf[16];
-    if (n < 1024ULL)
-        snprintf(buf, sizeof(buf), "%uB", (unsigned)n);
-    else if (n < 1024ULL * 1024)
-        snprintf(buf, sizeof(buf), "%.1fK", n / 1024.0);
-    else if (n < 1024ULL * 1024 * 1024)
-        snprintf(buf, sizeof(buf), "%.1fM", n / (1024.0 * 1024));
-    else
-        snprintf(buf, sizeof(buf), "%.1fG", n / (1024.0 * 1024 * 1024));
-    return buf;
-}
-
-} // namespace
+// Column and wire-field helpers live in text_format.h, shared with Calendar.
 
 // ─── construction ─────────────────────────────────────────────────────────────
 
@@ -157,9 +84,15 @@ fujiError_t NetworkProtocolMailbox::open(PeoplesUrlParser *urlParser, fileAccess
 
     bool isDir = (access == ACCESS_MODE::DIRECTORY || access == ACCESS_MODE::DIRECTORY_ALT);
     bool isRead = (access == ACCESS_MODE::READ);
-    if (!isDir && !isRead)
+    bool isWrite = (access == ACCESS_MODE::WRITE);
+    if (!isDir && !isRead && !isWrite)
     {
-        // Mailboxes are read-only.
+        // APPEND and READWRITE make no sense here.
+        error = NDEV_STATUS::READ_ONLY;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
+    if (isWrite && !can_write())
+    {
         error = NDEV_STATUS::READ_ONLY;
         return FUJI_ERROR::UNSPECIFIED;
     }
@@ -172,6 +105,39 @@ fujiError_t NetworkProtocolMailbox::open(PeoplesUrlParser *urlParser, fileAccess
 
     std::vector<std::string> parts = split_path(urlParser->path);
     fujiError_t res;
+
+    if (isWrite)
+    {
+        switch (parts.size())
+        {
+        case 0: // / -> compose a new message
+            _writeMode = true;
+            res = FUJI_ERROR::NONE;
+            break;
+        case 2: // /FOLDER/N -> reply. Resolve N now, so renumbering between
+                // open and the commit at close cannot retarget it.
+            _folder = parts[0];
+            _seq = (uint32_t)strtoul(parts[1].c_str(), nullptr, 10);
+            if (reply_target(_folder, _seq, _replyTarget) != FUJI_ERROR::NONE)
+            {
+                mailbox_error_to_error();
+                res = FUJI_ERROR::UNSPECIFIED;
+            }
+            else
+            {
+                _isReply = true;
+                _writeMode = true;
+                res = FUJI_ERROR::NONE;
+            }
+            break;
+        default:
+            error = NDEV_STATUS::INVALID_DEVICESPEC;
+            res = FUJI_ERROR::UNSPECIFIED;
+            break;
+        }
+        forceStatus = true;
+        return res;
+    }
 
     switch (parts.size())
     {
@@ -452,10 +418,111 @@ void NetworkProtocolMailbox::format_attachment_index_raw(const std::vector<Mailb
     *receiveBuffer = out;
 }
 
+// ─── write channel (compose / reply) ──────────────────────────────────────────
+
+fujiError_t NetworkProtocolMailbox::reply_target(const std::string &, uint32_t, MailReplyTarget &)
+{
+    error = NDEV_STATUS::READ_ONLY;
+    return FUJI_ERROR::UNSPECIFIED;
+}
+
+fujiError_t NetworkProtocolMailbox::message_send(const MailDraft &, const MailReplyTarget *)
+{
+    error = NDEV_STATUS::READ_ONLY;
+    return FUJI_ERROR::UNSPECIFIED;
+}
+
+fujiError_t NetworkProtocolMailbox::write(unsigned short len)
+{
+    was_write = true;
+
+    size_t n = len;
+    if (n > transmitBuffer->length()) n = transmitBuffer->length();
+
+    if (!_writeMode)
+    {
+        transmitBuffer->erase(0, n);
+        error = NDEV_STATUS::READ_ONLY;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
+    if (_writeBuf.size() + n > MB_MAX_WRITE)
+    {
+        transmitBuffer->erase(0, n);
+        _writeFailed = true;
+        error = NDEV_STATUS::NO_SPACE_ON_DEVICE;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
+
+    _writeBuf.append(*transmitBuffer, 0, n);
+    transmitBuffer->erase(0, n);
+    error = NDEV_STATUS::SUCCESS;
+    return FUJI_ERROR::NONE;
+}
+
+fujiError_t NetworkProtocolMailbox::close()
+{
+    fujiError_t res = FUJI_ERROR::NONE;
+    if (_writeMode && !_committed)
+    {
+        _committed = true;
+        if (!transmitBuffer->empty())
+            write((unsigned short)std::min(transmitBuffer->length(), (size_t)0xFFFF));
+        res = commit_write();
+    }
+
+    // The base close resets `error`; keep the commit result visible so the bus
+    // layer can latch it into the STATUS that follows the close.
+    nDevStatus_t saved = error;
+    NetworkProtocol::close();
+    error = saved;
+    return res;
+}
+
+fujiError_t NetworkProtocolMailbox::commit_write()
+{
+    if (_writeBuf.empty())
+    {
+        // Opened for write, closed without writing: an abort, not an error.
+        error = NDEV_STATUS::SUCCESS;
+        return FUJI_ERROR::NONE;
+    }
+    if (_writeFailed)
+    {
+        error = NDEV_STATUS::NO_SPACE_ON_DEVICE;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
+
+    MailDraft draft;
+    MailDraftError derr = mail_draft_parse(_writeBuf, draft);
+    if (derr == MailDraftError::NONE)
+        derr = mail_draft_finalize(draft, _isReply ? &_replyTarget : nullptr);
+    if (derr != MailDraftError::NONE)
+    {
+        Debug_printf("Mailbox: draft rejected (%d)\r\n", (int)derr);
+        error = NDEV_STATUS::INVALID_COMMAND;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
+
+    fujiError_t res = message_send(draft, _isReply ? &_replyTarget : nullptr);
+    if (res != FUJI_ERROR::NONE)
+    {
+        mailbox_error_to_error();
+        return res;
+    }
+
+    error = NDEV_STATUS::SUCCESS;
+    return FUJI_ERROR::NONE;
+}
+
 // ─── read / status / available ────────────────────────────────────────────────
 
 fujiError_t NetworkProtocolMailbox::read(unsigned short len)
 {
+    if (_writeMode)
+    {
+        error = NDEV_STATUS::WRITE_ONLY;
+        return FUJI_ERROR::UNSPECIFIED;
+    }
     // All content is staged into receiveBuffer at open(); the device drains it.
     error = NDEV_STATUS::SUCCESS;
     return FUJI_ERROR::NONE;
@@ -463,6 +530,13 @@ fujiError_t NetworkProtocolMailbox::read(unsigned short len)
 
 fujiError_t NetworkProtocolMailbox::status(NetworkStatus *status)
 {
+    if (_writeMode)
+    {
+        // A write channel is never at EOF; report health, not drain state.
+        status->error = error;
+        status->connected = 1;
+        return FUJI_ERROR::NONE;
+    }
     if (error == NDEV_STATUS::SUCCESS && receiveBuffer->empty())
         status->error = NDEV_STATUS::END_OF_FILE;
     else

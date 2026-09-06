@@ -9,10 +9,10 @@
 #include "peoples_url_parser.h"
 
 #include "Protocol.h"
+#include "network_data.h"
 
 #include "fnjson.h"
-
-#include "ProtocolParser.h"
+#include "fnsgml.h"
 
 /**
  * Number of devices to expose via ADAM, becomes 0x71 to 0x70 + NUM_DEVICES - 1
@@ -55,7 +55,7 @@ public:
      * Called for ADAM Command 'O' to open a connection to a network protocol, allocate all buffers,
      * and start the receive PROCEED interrupt.
      */
-    void open(unsigned short s);
+    void open(const FujiAdamPacket &packet);
 
     /**
      * Called for ADAM Command 'C' to close a connection to a network protocol, de-allocate all buffers,
@@ -69,7 +69,7 @@ public:
      * Write # of bytes specified by aux1/aux2 from tx_buffer out to ADAM. If protocol is unable to return requested
      * number of bytes, return ERROR.
      */
-    void write(uint16_t num_bytes);
+    void write(const FujiAdamPacket &packet);
 
     /**
      * ADAM Special, called as a default for any other ADAM command not processed by the other adamnet_ functions.
@@ -79,20 +79,18 @@ public:
      */
     void status();
 
-    void adamnet_control_ack();
-    void adamnet_control_clr();
-    void adamnet_control_receive();
-    void adamnet_control_receive_channel_json();
-    void adamnet_control_receive_channel_protocol();
-    void adamnet_control_send();
+    void adamnet_control_send(const FujiAdamPacket &packet) override;
+    void adamnet_control_receive() override;
 
-    void adamnet_response_status() override;
-    void adamnet_response_send();
+    AdamNetStatus deviceStatus() override;
+    std::optional<ByteBuffer> adamnet_control_receive_channel_json();
+    std::optional<ByteBuffer> adamnet_control_receive_channel_sgml();
+    std::optional<ByteBuffer> adamnet_control_receive_channel_protocol();
 
     /**
      * @brief Called to set prefix
      */
-    void set_prefix(unsigned short s);
+    void set_prefix(const FujiAdamPacket &packet);
 
     /**
      * @brief Called to get prefix
@@ -102,17 +100,17 @@ public:
     /**
      * @brief called to set login
      */
-    void set_login(uint16_t s);
+    void set_login(const FujiAdamPacket &packet);
 
     /**
      * @brief called to set password
      */
-    void set_password(uint16_t s);
+    void set_password(const FujiAdamPacket &packet);
 
     /**
      * @brief set channel mode
      */
-    void channel_mode();
+    void channel_mode(const FujiAdamPacket &packet);
 
     /**
      * @brief parse incoming data
@@ -123,7 +121,18 @@ public:
      * @brief JSON Query
      * @param s size of query
      */
-    void json_query(unsigned short s);
+    void json_query(const FujiAdamPacket &packet);
+
+    /**
+     * @brief parse incoming SGML/HTML/XML
+     */
+    void sgml_parse();
+
+    /**
+     * @brief SGML CSS selector Query
+     * @param s size of query
+     */
+    void sgml_query(const FujiAdamPacket &packet);
 
     /**
      * Check to see if PROCEED needs to be asserted.
@@ -134,32 +143,21 @@ public:
      * Process incoming ADAM command for device 0x7X
      * @param b The incoming command byte
      */
-    void adamnet_process(const FujiAdamPacket &packet) override;
-    void process_fs(fujiCommandID_t cmd, unsigned pkt_len);
-    void process_tcp(fujiCommandID_t cmd);
-    void process_http(fujiCommandID_t cmd);
-    void process_udp(fujiCommandID_t cmd);
+    void process_fs(const FujiAdamPacket &packet);
+    void process_tcp(const FujiAdamPacket &packet);
+    void process_http(const FujiAdamPacket &packet);
+    void process_udp(const FujiAdamPacket &packet);
 
 private:
-    /**
-     * AdamNet Response Buffer
-     */
-    uint8_t response[1024];
-
-    /**
-     * AdamNet Response Length
-     */
-    uint16_t response_len=0;
-
     /**
      * JSON Object
      */
     FNJSON json;
 
     /**
-     * Has JSON been sent via CLR?
+     * SGML Object (HTML/XML via CSS selector)
      */
-    bool jsonRecvd = false;
+    FNSGML sgml;
 
     /**
      * The Receive buffer for this N: device
@@ -184,18 +182,13 @@ private:
     /**
      * Instance of currently open network protocol
      */
-    NetworkProtocol *protocol = nullptr;
+    std::unique_ptr<NetworkProtocol> protocol = nullptr;
 
     /**
      * Error from the last failed open, reported by get_error() while no
      * protocol is instantiated
      */
     nDevStatus_t err_open = NDEV_STATUS::NOT_CONNECTED;
-
-    /**
-     * @brief Factory that creates protocol from urls
-    */
-    ProtocolParser *protocolParser = nullptr;
 
     /**
      * Network Status object
@@ -246,20 +239,7 @@ private:
      * @enum PROTOCOL Send to protocol
      * @enum JSON Send to JSON parser.
      */
-    enum _channel_mode
-    {
-        PROTOCOL,
-        JSON
-    } channelMode;
-
-    /**
-     * The current receive state, are we sending channel or status data?
-     */
-    enum _receive_mode
-    {
-        CHANNEL,
-        STATUS
-    } receiveMode = CHANNEL;
+    channelMode_t channelMode = CHANNEL_MODE::PROTOCOL;
 
     /**
      * saved NetworkStatus items
@@ -304,13 +284,6 @@ private:
      * DeviceSpec will be transformed to only contain the relevant part of the deviceSpec, sans comma.
      */
     void processCommaFromDevicespec();
-
-    /**
-     * Perform the correct read based on value of channelMode
-     * @param num_bytes Number of bytes to read.
-     * @return FUJI_ERROR::UNSPECIFIED on error, FUJI_ERROR::NONE on success. Passed directly to bus_to_computer().
-     */
-    fujiError_t read_channel(unsigned short num_bytes);
 
     /**
      * Perform the correct write based on value of channelMode

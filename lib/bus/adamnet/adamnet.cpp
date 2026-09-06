@@ -77,39 +77,28 @@ static void adamnet_reset_intr_task(void *arg)
 static void adamnet_bus_task(void *arg)
 {
     systemBus *b = (systemBus *)arg;
+    b->adamnet_handle_bus_task();
+}
+
+void systemBus::adamnet_handle_bus_task(void)
+{
     int64_t last = GET_TIMESTAMP();
     for (;;)
     {
         int64_t now = GET_TIMESTAMP();
 
-        if (now - last > ADAMNET_STALL_RESYNC_US && b->available())
-            b->wait_for_idle();
-        b->service();
+        if (now - last > ADAMNET_STALL_RESYNC_US && _port->available())
+            wait_for_idle();
+        service();
         last = GET_TIMESTAMP();
         taskYIELD(); // cooperative; returns at once when no other core-1 task is ready
     }
 }
 #endif // ESP_PLATFORM
 
-uint8_t adamnet_checksum(uint8_t *buf, unsigned short len)
-{
-    uint8_t checksum = 0x00;
-
-    for (unsigned short i = 0; i < len; i++)
-        checksum ^= buf[i];
-
-    return checksum;
-}
-
 void systemBus::transaction_accept(transState_t expectMoreData)
 {
     assert(_transaction_state == TRANS_STATE::INVALID);
-
-    // By the time we get to transaction_accept the payload has been
-    // read by FujiAdamPacket and needs to be acked.
-    start_time = GET_TIMESTAMP();
-    _activeDev->adamnet_response_ack();
-
     _transaction_state = expectMoreData;
 }
 
@@ -117,11 +106,22 @@ void systemBus::transaction_success()
 {
     assert(_transaction_state == TRANS_STATE::NO_GET
            || _transaction_state == TRANS_STATE::DID_GET);
+    // Data was requested but didn't go through transaction_send
+    if (_activePacket->type() == APT::MN_RECEIVE)
+        busPhase.didIgnore();
+    else if (busPhase.needAck())
+        sendAckPacket();
     _transaction_state = TRANS_STATE::INVALID;
 }
 
 void systemBus::transaction_error()
 {
+    if (busPhase.needAck())
+    {
+        wait_for_idle();
+        _start_time = GET_TIMESTAMP();
+        sendNakPacket();
+    }
     _transaction_state = TRANS_STATE::INVALID;
 }
 
@@ -129,9 +129,8 @@ success_is_true systemBus::transaction_get(void *data, size_t len)
 {
     assert(_transaction_state == TRANS_STATE::WILL_GET);
     _transaction_state = TRANS_STATE::DID_GET;
-    if (_activePacket->data()->size() != len)
-        RETURN_ERROR_AS_FALSE();
-    std::copy(_activePacket->data()->begin(), _activePacket->data()->end(),
+    len = std::min(len, _activePacket->data()->size());
+    std::copy(_activePacket->data()->begin(), _activePacket->data()->begin() + len,
               static_cast<uint8_t *>(data));
     RETURN_SUCCESS_AS_TRUE();
 }
@@ -139,107 +138,110 @@ success_is_true systemBus::transaction_get(void *data, size_t len)
 void systemBus::transaction_send(const void *data, size_t len, bool err)
 {
     assert(_transaction_state == TRANS_STATE::NO_GET);
-    memcpy(_activeDev->response, data, len);
-    _activeDev->response_len = len;
+    const uint8_t *ptr = static_cast<const uint8_t*>(data);
+    FujiAdamPacket packet(_activeDev->id(), APT::NM_SEND, ByteBuffer(ptr, ptr + len));
+    _transaction_reply_encoded = packet.serialize();
+
+    // FIXME - won't this always ack? Is the if needed?
+    if (busPhase.needAck())
+        sendAckPacket();
+
     _transaction_state = TRANS_STATE::INVALID;
 }
 
-void virtualDevice::adamnet_send(uint8_t b)
+bool systemBus::sendReplyPacket(bool ack, const void *data, size_t length)
 {
-    // Write the byte
-    SYSTEM_BUS.write(b);
-    SYSTEM_BUS.flush();
-}
+    adamPacketType_t ptype;
 
-void virtualDevice::adamnet_send_buffer(uint8_t *buf, unsigned short len)
-{
-    SYSTEM_BUS.write(buf, len);
-    SYSTEM_BUS.flush();
-}
 
-uint8_t virtualDevice::adamnet_recv()
-{
-    uint8_t b;
-    int64_t start = GET_TIMESTAMP();
-
-    while (SYSTEM_BUS.available() <= 0)
+    switch (_activePacket->type())
     {
-        if (GET_TIMESTAMP() - start > ADAMNET_RECV_TIMEOUT_US)
-        {
-            SYSTEM_BUS.frame_error = true;
-            return 0;
-        }
-        fnSystem.yield();
+    case APT::MN_STATUS:
+        ptype = APT::NM_STATUS;
+        break;
+
+    case APT::MN_SEND:
+    case APT::MN_RECEIVE:
+    case APT::MN_READY:
+        ptype = ack ? APT::NM_ACK : APT::NM_NAK;
+        break;
+
+    case APT::MN_CLR:
+        ptype = APT::NM_SEND;
+        break;
+
+    default:
+        abort();
     }
 
-    b = SYSTEM_BUS.read();
+    std::optional<FujiAdamPacket> packet;
+    if (ack && data)
+    {
+        const uint8_t *ptr = static_cast<const uint8_t*>(data);
+        packet.emplace(_activeDev->id(), ptype, ByteBuffer(ptr, ptr + length));
+    }
+    else
+        packet.emplace(_activeDev->id(), ptype);
 
-    return b;
+    return writeBusPacket(*packet);
 }
 
-uint16_t virtualDevice::adamnet_recv_length()
+void systemBus::sendResponsePacket(void)
 {
-    unsigned short s = 0;
-    s = adamnet_recv() << 8;
-    s |= adamnet_recv();
+    if (!_transaction_reply_encoded.has_value())
+        return;
 
-    return s;
+#ifdef ESP_PLATFORM
+    // Real bus only: answer only inside the window of opportunity
+    if (GET_TIMESTAMP() - _start_time >= ADAMNET_RESPONSE_DEADLINE_US)
+    {
+        busPhase.didIgnore();
+        return;
+    }
+#endif /* ESP_PLATFORM */
+
+    _port->write(_transaction_reply_encoded->data(), _transaction_reply_encoded->size());
+    _port->flushOutput();
+    busPhase.sentData();
+    _transaction_reply_encoded.reset();
 }
 
-void virtualDevice::adamnet_send_length(uint16_t l)
+bool systemBus::writeBusPacket(const FujiAdamPacket &packet)
 {
-    adamnet_send(l >> 8);
-    adamnet_send(l & 0xFF);
+    ByteBuffer encoded = packet.serialize();
+#ifdef ESP_PLATFORM
+    // Real bus only: answer only inside the window of opportunity
+    if (GET_TIMESTAMP() - _start_time >= ADAMNET_RESPONSE_DEADLINE_US)
+        return false;
+#endif /* ESP_PLATFORM */
+
+    _port->write(encoded.data(), encoded.size());
+    _port->flushOutput();
+#ifdef DEBUG_RAW_PACKET
+    Debug_printv("Sent %d:\n%s", encoded.size(),
+                 util_hexdump(encoded.data(), encoded.size()).c_str());
+#endif // DEBUG_RAW_PACKET
+    return true;
 }
 
-unsigned short virtualDevice::adamnet_recv_buffer(uint8_t *buf, unsigned short len)
+fujiDeviceID_t virtualDevice::id()
 {
-    return SYSTEM_BUS.read(buf, len);
-}
-
-uint32_t virtualDevice::adamnet_recv_blockno()
-{
-    unsigned char x[4] = {0x00, 0x00, 0x00, 0x00};
-
-    adamnet_recv_buffer(x, 4);
-
-    return x[3] << 24 | x[2] << 16 | x[1] << 8 | x[0];
+    return SYSTEM_BUS.fujiIDForDevice(this);
 }
 
 void virtualDevice::reset()
 {
-    Debug_printf("No Reset implemented for device %u\n", _devnum);
-}
-
-void virtualDevice::adamnet_response_ack(bool doNotWaitForIdle)
-{
-    if (!doNotWaitForIdle)
-        SYSTEM_BUS.min_turnaround();
-
-#ifdef ESP_PLATFORM
-    // Real bus only: don't answer past the master's window. BoIP just waits.
-    if (GET_TIMESTAMP() - SYSTEM_BUS.start_time >= ADAMNET_RESPONSE_DEADLINE_US)
-        return;
-#endif
-    adamnet_send(0x90 | _devnum);
-}
-
-void virtualDevice::adamnet_response_nack(bool doNotWaitForIdle)
-{
-    if (!doNotWaitForIdle)
-        SYSTEM_BUS.min_turnaround();
-
-#ifdef ESP_PLATFORM
-    // Real bus only: don't answer past the master's window. BoIP just waits.
-    if (GET_TIMESTAMP() - SYSTEM_BUS.start_time >= ADAMNET_RESPONSE_DEADLINE_US)
-        return;
-#endif
-    adamnet_send(0xC0 | _devnum);
+    Debug_printf("No Reset implemented for device %u\n", id());
 }
 
 void virtualDevice::adamnet_control_ready()
 {
-    adamnet_response_ack();
+    SYSTEM_BUS.sendAckPacket();
+}
+
+void virtualDevice::adamnet_control_receive()
+{
+    SYSTEM_BUS.sendAckPacket();
 }
 
 void systemBus::wait_for_idle()
@@ -248,93 +250,39 @@ void systemBus::wait_for_idle()
     fnSystem.yield();
 }
 
-void systemBus::wait_turnaround(uint32_t us)
+void systemBus::sendStatusPacket(const AdamNetStatus &status)
 {
 #ifdef ESP_PLATFORM
-    // Hold off the shared one-wire bus until `us` after the command.
-    int64_t dt = GET_TIMESTAMP() - start_time;
-    if (dt >= 0 && dt < (int64_t)us)
-        fnSystem.delay_microseconds(us - dt);
-#else
-    // BoIP has no shared wire, and usleep() can't honor sub-ms holds anyway.
-    (void)us;
+    // Real bus only: answer only inside the master's status
+    // window. This will prevent Adam from recognizing that device is
+    // online, it will not retry.
+    if (GET_TIMESTAMP() - _start_time >= ADAMNET_RESPONSE_DEADLINE_US)
+    {
+        busPhase.didIgnore();
+        return;
+    }
 #endif
-}
 
-void systemBus::min_turnaround()
-{
-    wait_turnaround(ADAMNET_TURNAROUND_US);
-}
-
-void systemBus::drain_echo(size_t n)
-{
-    // Because: Everything we transmit on the one-wire bus echoes back into our own RX.
-    if (n == 0)
-        return;
-    if (n > ECHO_DRAIN_MAX)
-    {
-        wait_for_idle();
-        return;
-    }
-
-    uint8_t scratch[ECHO_DRAIN_MAX];
-    size_t got = 0;
-    int64_t last = GET_TIMESTAMP();
-
-    while (got < n)
-    {
-        size_t avail = _port->available();
-        if (avail)
-        {
-            size_t take = n - got;
-            if (take > avail)
-                take = avail;
-            got += _port->read(scratch, take);
-            last = GET_TIMESTAMP();
-        }
-        else if (GET_TIMESTAMP() - last > ECHO_SETTLE_US)
-        {
-            break; // straggler window elapsed; don't wait for a lost echo byte
-        }
-    }
-}
-
-void virtualDevice::adamnet_process(const FujiAdamPacket &packet)
-{
-    Debug_printf("adamnet_process() not implemented yet for this device: 0x%02x  type: 0x%02x\n", packet.device(), packet.type());
-}
-
-void virtualDevice::adamnet_control_status()
-{
-    SYSTEM_BUS.start_time=GET_TIMESTAMP();
-   adamnet_response_status();
-}
-
-void virtualDevice::adamnet_response_status()
-{
-    status_response.cmd_dev = (static_cast<uint8_t>(APT::NM_STATUS) << 4) | _devnum;
-
-    status_response.checksum = adamnet_checksum((uint8_t *) &status_response.length, 4);
-
-    SYSTEM_BUS.min_turnaround();
-    adamnet_send_buffer((uint8_t *) &status_response, sizeof(status_response));
-}
-
-void virtualDevice::adamnet_control_clr()
-{
-    if (response_len == 0)
-    {
-        adamnet_response_nack();
-    }
+    if (sendReplyPacket(true, &status, sizeof(status)))
+        busPhase.sentStatus();
     else
-    {
-        adamnet_send(0xB0 | _devnum);
-        adamnet_send_length(response_len);
-        adamnet_send_buffer(response, response_len);
-        adamnet_send(adamnet_checksum(response, response_len));
-        memset(response, 0, sizeof(response));
-        response_len = 0;
-    }
+        busPhase.didIgnore();
+}
+
+void systemBus::sendAckPacket()
+{
+    if (sendReplyPacket(true))
+        busPhase.didAck();
+    else
+        busPhase.didIgnore();
+}
+
+void systemBus::sendNakPacket()
+{
+    if (sendReplyPacket(false))
+        busPhase.didNak();
+    else
+        busPhase.didIgnore();
 }
 
 void virtualDevice::adamnet_idle()
@@ -342,50 +290,120 @@ void virtualDevice::adamnet_idle()
     // Not implemented in base class
 }
 
-//void virtualDevice::adamnet_status()
-//{
-//    fnDebugConsole.printf("adamnet_status() not implemented yet for this device.\n");
-//}
-
 void systemBus::_adamnet_process_cmd()
 {
-    uint8_t dest = _port->read();
     int64_t cmd_start = GET_TIMESTAMP();
-    start_time = cmd_start;
+    _start_time = cmd_start;
     frame_error = false;
-    _tx_count = 0;
-    stall_silent = false;
+    _stall_silent = false;
 
-    auto tmpPacket = FujiAdamPacket(dest);
+    auto tmpPacket = FujiAdamPacket(_port->read());
+    _activeDev = _daisyChain.deviceWithFujiID(tmpPacket.device());
+    if (_activeDev && _activeDev->device_active == true)
+    {
+        busPhase.begin(tmpPacket);
 
-    // Find device ID and pass control to it
-    if (_daisyChain.count(tmpPacket.device()) < 1)
-    {
-    }
-    else if (_daisyChain[tmpPacket.device()]->device_active == true)
-    {
         // turn on AdamNet Indicator LED
         fnLedManager.set(eLed::LED_BUS, true);
-        _activeDev = _daisyChain[tmpPacket.device()];
+
         _activePacket = &tmpPacket;
-        _activeDev->adamnet_process(tmpPacket);
+
+        if (tmpPacket.type() == APT::MN_SEND)
+        {
+            u16be_t len, rlen;
+            ByteBuffer buffer;
+            uint8_t ck;
+
+            _port->read(&len, sizeof(len));
+            buffer.resize(len);
+            rlen = _port->read(buffer.data(), buffer.size());
+            if (rlen != len)
+                buffer.resize(rlen);
+            ck = _port->read();
+            busPhase.gotPayload();
+
+            // Reset window of opportunity after reading last byte of payload;
+            _start_time = GET_TIMESTAMP();
+
+            if (tmpPacket.setPayload(buffer, ck).is_error())
+            {
+                // At this stage the Adam only wants to know if we received the packet ok.
+                sendNakPacket();
+                goto done;
+            }
+
+            sendAckPacket();
+        }
+
+        _adamnet_dispatch(tmpPacket);
+
+    done:
         // turn off AdamNet Indicator LED
         fnLedManager.set(eLed::LED_BUS, false);
+
+#ifdef DEBUG_FINAL_PACKET_STATE
+        Debug_printf("packet complete device=0x%x type=0x%x phase=%d\n",
+                     tmpPacket.device(), tmpPacket.type(), busPhase.phase());
+#endif
+
+        busPhase.finish();
     }
 
-    if (stall_silent)
-    {
-        if (GET_TIMESTAMP() - cmd_start > ADAMNET_LONG_CMD_US)
-            wait_for_idle();
-        else
-            fnSystem.yield();
-    }
-    else if (GET_TIMESTAMP() - cmd_start > ADAMNET_LONG_CMD_US)
-        wait_for_idle();
-    else if (_tx_count > 0 && !frame_error)
-        drain_echo(_tx_count);
+    if (_stall_silent && (GET_TIMESTAMP() - cmd_start <= ADAMNET_LONG_CMD_US))
+        fnSystem.yield();
     else
         wait_for_idle();
+}
+
+// Handle the five stages of AdamNet bus protocol
+void systemBus::_adamnet_dispatch(const FujiAdamPacket &packet)
+{
+#ifdef DEBUG_DISPATCH
+    Debug_printf("Dispatching device: %s (0x%02x)  type: %s (0x%02x)\n",
+                 AdamNetPhase::device_to_string(packet.device()), packet.device(),
+                 AdamNetPhase::type_to_string(packet.type()), packet.type());
+    if ((packet.device() == FUJI_DEVICEID::FUJINET || packet.device() == FUJI_DEVICEID::NETWORK)
+        && packet.type() == APT::MN_SEND)
+        Debug_printf("Fuji command: 0x%02x\n", packet.command());
+#endif // DEBUG_DISPATCH
+
+    switch (packet.type())
+    {
+    case APT::MN_STATUS:
+        // Get device capablities/check if it is alive
+        sendStatusPacket(_activeDev->deviceStatus());
+        break;
+
+    case APT::MN_CLR:
+        // Fetch the data from a previous read()/readBlock() request
+        sendResponsePacket();
+        break;
+
+    case APT::MN_RECEIVE:
+        // read() or readBlock()
+        if (_transaction_reply_encoded.has_value())
+            sendAckPacket();
+        else
+            _activeDev->adamnet_control_receive();
+        break;
+
+    case APT::MN_SEND:
+        // write() or writeBlock()
+        _activeDev->adamnet_control_send(packet);
+        break;
+
+    case APT::MN_READY:
+        // Check if device is ready for a command
+        _activeDev->adamnet_control_ready();
+        break;
+
+    case APT::MN_RESET:
+        _activeDev->reset();
+        break;
+
+    default:
+        break;
+    }
 }
 
 #ifdef ESP_PLATFORM
@@ -397,8 +415,9 @@ void systemBus::_adamnet_process_queue()
         switch (msg.message_id)
         {
         case ADAMNETMSG_DISKSWAP:
-            if (_fujiDev != nullptr)
-                _fujiDev->fujicmd_image_rotate();
+            auto fujiDev = dynamic_cast<adamFuji *>(_daisyChain.deviceWithFujiID(FUJI_DEVICEID::FUJINET));
+            if (fujiDev != nullptr)
+                fujiDev->fujicmd_image_rotate();
             break;
         }
     }
@@ -442,14 +461,15 @@ void systemBus::setup()
 
     // Set up UART
     _serial.begin(ChannelConfig()
-                .deviceID(FN_UART_BUS)
-                .baud(ADAMNET_BAUDRATE)
-                .inverted(true)
-                .readTimeout(2.0)
-                .discardTimeout(0.180)
-                .rxThreshold(1)
-                .txBuffer(2048)
-                );
+                  .deviceID(FN_UART_BUS)
+                  .baud(ADAMNET_BAUDRATE)
+                  .inverted(true)
+                  .readTimeout(2.0)
+                  .discardTimeout(0.180)
+                  .rxThreshold(1)
+                  .txBuffer(2048)
+                  .halfDuplex(true)
+                  );
     _port = &_serial;
 #else
     // PC build: carry AdamNet over a TCP socket (Bus over IP) when enabled,
@@ -460,7 +480,6 @@ void systemBus::setup()
                        .hostName(Config.get_boip_host())
                        .portNum(Config.get_boip_port())
                        .client()
-                       .localEcho(true)
                        .nonBlocking()  // recv path can't absorb a blocking poll; idle is throttled by poll(1) in service()
                        .noDelay()      // disable Nagle: tiny request/response packets
                        .readTimeout(1000)
@@ -498,102 +517,16 @@ void systemBus::shutdown()
 
     for (auto devicep : _daisyChain)
     {
-        Debug_printf("Shutting down device %02x\n", devicep.second->id());
-        devicep.second->shutdown();
+        Debug_printf("Shutting down device %02x\n", devicep->id());
+        devicep->shutdown();
     }
     Debug_printf("All devices shut down.\n");
-}
-
-void systemBus::addDevice(virtualDevice *pDevice, uint8_t device_id)
-{
-    Debug_printf("Adding device: %02X\n", device_id);
-    pDevice->_devnum = device_id;
-    _daisyChain[device_id] = pDevice;
-
-    switch (device_id)
-    {
-    case 0x02:
-        _printerDev = (adamPrinter *)pDevice;
-        break;
-    case 0x0f:
-        _fujiDev = dynamic_cast<adamFuji*>(pDevice);
-        break;
-    }
-}
-
-bool systemBus::deviceExists(uint8_t device_id)
-{
-    return _daisyChain.find(device_id) != _daisyChain.end();
-}
-
-bool systemBus::deviceEnabled(uint8_t device_id)
-{
-    if (deviceExists(device_id))
-        return _daisyChain[device_id]->device_active;
-    else
-        return false;
-}
-
-void systemBus::remDevice(virtualDevice *pDevice)
-{
-}
-
-void systemBus::remDevice(uint8_t device_id)
-{
-    if (deviceExists(device_id))
-    {
-        _daisyChain.erase(device_id);
-    }
-}
-
-int systemBus::numDevices()
-{
-    return _daisyChain.size();
-}
-
-void systemBus::changeDeviceId(virtualDevice *p, uint8_t device_id)
-{
-    for (auto it = _daisyChain.begin(); it != _daisyChain.end(); ++it)
-    {
-        if (it->second == p)
-        {
-            _daisyChain.erase(it);
-            break;
-        }
-    }
-    p->_devnum = device_id;
-    _daisyChain[device_id] = p;
-}
-
-virtualDevice *systemBus::deviceById(uint8_t device_id)
-{
-    for (auto devicep : _daisyChain)
-    {
-        if (devicep.second->_devnum == device_id)
-            return devicep.second;
-    }
-    return nullptr;
 }
 
 void systemBus::reset()
 {
     for (auto devicep : _daisyChain)
-        devicep.second->reset();
+        devicep->reset();
 }
 
-void systemBus::enableDevice(uint8_t device_id)
-{
-    Debug_printf("Enabling AdamNet Device %d\n",device_id);
-
-    if (_daisyChain.find(device_id) != _daisyChain.end())
-        _daisyChain[device_id]->device_active = true;
-}
-
-void systemBus::disableDevice(uint8_t device_id)
-{
-    Debug_printf("Disabling AdamNet Device %d\n",device_id);
-
-    if (_daisyChain.find(device_id) != _daisyChain.end())
-        _daisyChain[device_id]->device_active = false;
-}
 #endif /* BUILD_ADAM */

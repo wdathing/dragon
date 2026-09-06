@@ -19,7 +19,7 @@ set(INCLUDES
     ${CMAKE_SOURCE_DIR}/lib/bus/s100spi
     ${CMAKE_SOURCE_DIR}/lib/bus/sio
 
-    ${CMAKE_SOURCE_DIR}/lib/clock
+    ${CMAKE_SOURCE_DIR}/lib/clipboard
     ${CMAKE_SOURCE_DIR}/lib/compat
     ${CMAKE_SOURCE_DIR}/lib/config
 
@@ -44,6 +44,7 @@ set(INCLUDES
     ${CMAKE_SOURCE_DIR}/lib/device/s100spi
     ${CMAKE_SOURCE_DIR}/lib/device/sio
     ${CMAKE_SOURCE_DIR}/lib/device/fujiDevice
+    ${CMAKE_SOURCE_DIR}/lib/device/fujiClock
 
     ${CMAKE_SOURCE_DIR}/lib/devrelay
     ${CMAKE_SOURCE_DIR}/lib/devrelay/commands
@@ -57,6 +58,7 @@ set(INCLUDES
     ${CMAKE_SOURCE_DIR}/lib/FileSystem
     ${CMAKE_SOURCE_DIR}/lib/fn_esp_http_client
     ${CMAKE_SOURCE_DIR}/lib/fnjson
+    ${CMAKE_SOURCE_DIR}/lib/fnsgml
     ${CMAKE_SOURCE_DIR}/lib/ftp
     ${CMAKE_SOURCE_DIR}/lib/fuji
     ${CMAKE_SOURCE_DIR}/lib/hardware
@@ -97,7 +99,7 @@ FILE(GLOB_RECURSE SOURCES
     ${CMAKE_SOURCE_DIR}/lib/bus/s100spi/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/bus/sio/*.cpp
 
-    ${CMAKE_SOURCE_DIR}/lib/clock/*.cpp
+    ${CMAKE_SOURCE_DIR}/lib/clipboard/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/compat/*.c
     ${CMAKE_SOURCE_DIR}/lib/config/*.cpp
 
@@ -133,6 +135,7 @@ FILE(GLOB_RECURSE SOURCES
     ${CMAKE_SOURCE_DIR}/lib/FileSystem/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/fn_esp_http_client/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/fnjson/*.cpp
+    ${CMAKE_SOURCE_DIR}/lib/fnsgml/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/ftp/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/fuji/*.cpp
     ${CMAKE_SOURCE_DIR}/lib/gpiox/*.cpp
@@ -160,7 +163,7 @@ FILE(GLOB_RECURSE SOURCES
 idf_component_register(
     INCLUDE_DIRS ${INCLUDES}
     SRCS ${SOURCES}
-    PRIV_REQUIRES esp_driver_uart esp_netif esp_driver_gpio fatfs vfs json esp_wifi mbedtls console app_update spi_flash mlff esp_driver_ledc expat http_parser esp-tls tcp_transport esp_driver_gptimer esp_driver_tsens esp_http_client esp_websocket_client libssh
+    PRIV_REQUIRES esp_driver_uart esp_netif esp_driver_gpio fatfs vfs json esp_wifi mbedtls console app_update spi_flash mlff esp_driver_ledc expat gumbo gumbo-query http_parser esp-tls tcp_transport esp_driver_gptimer esp_driver_tsens esp_http_client esp_websocket_client libssh
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-value)

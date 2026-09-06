@@ -126,8 +126,8 @@ void drivewireFuji::new_disk()
         char filename[MAX_FILENAME_LEN]; // WIll set this to MAX_FILENAME_LEN, later.
     } newDisk;
 
-    transaction_begin(TRANS_STATE::WILL_GET);
-    transaction_get(&newDisk, sizeof(newDisk));
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
+    SYSTEM_BUS.transaction_get(&newDisk, sizeof(newDisk));
 
     Debug_printf("numDisks: %u\n",newDisk.numDisks);
     Debug_printf("hostSlot: %u\n",newDisk.hostSlot);
@@ -145,7 +145,7 @@ void drivewireFuji::new_disk()
     if (host.file_exists(disk.filename))
     {
         Debug_printf("drivewire_new_disk File exists: \"%s\"\n", disk.filename);
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
@@ -153,16 +153,16 @@ void drivewireFuji::new_disk()
     if (disk.fileh == nullptr)
     {
         Debug_printf("drivewire_new_disk Couldn't open file for writing: \"%s\"\n", disk.filename);
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
     bool ok = disk.disk_dev.write_blank(disk.fileh, newDisk.numDisks);
 
     if (ok)
-        transaction_complete();
+        SYSTEM_BUS.transaction_success();
     else
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
 
     fnio::fclose(disk.fileh);
 }
@@ -175,7 +175,7 @@ void drivewireFuji::setup()
 
     populate_slots_from_config();
 
-    insert_boot_device(Config.get_general_boot_mode(), MEDIATYPE_UNKNOWN, &bootdisk);
+    insert_boot_device(Config.get_general_boot_mode(), MEDIATYPE_UNKNOWN, FUJI_BOOTDISK);
 
     // Disable booting from CONFIG if our settings say to turn it off
     boot_config = Config.get_general_config_enabled();
@@ -206,154 +206,21 @@ void drivewireFuji::random()
 {
     int r = rand();
     Debug_printf("drivewireFuji::random(%u)\n",r);
-    transaction_put(&r, sizeof(r));
+    SYSTEM_BUS.transaction_send(&r, sizeof(r));
 }
 
 bool drivewireFuji::processCommand(const FujiDWPacket &packet)
 {
+    _errorCode = NDEV_STATUS::SUCCESS;
+
     // Let the base class handle standard commands
     if (fujiDevice::processCommand(packet))
         return true;
 
-    _errorCode = NDEV_STATUS::SUCCESS;
     switch (packet.command())
     {
-    case FUJICMD_RESET:
-        fnSystem.reboot();
-        break;
-    case FUJICMD_GET_ADAPTERCONFIG:
-        fujicmd_get_adapter_config();
-        break;
-    case FUJICMD_GET_ADAPTERCONFIG_EXTENDED:
-        fujicmd_get_adapter_config_extended();
-        break;
-    case FUJICMD_GET_SCAN_RESULT:
-        fujicmd_net_scan_result(packet.param(0));
-        break;
-    case FUJICMD_SCAN_NETWORKS:
-        fujicmd_net_scan_networks();
-        break;
-    case FUJICMD_SET_SSID:
-        {
-            SSIDConfig cfg;
-            // Handler owns the transaction because it must transaction_get the
-            // payload first, so call the core (not fujicmd_) set-ssid helper.
-            transaction_begin(TRANS_STATE::WILL_GET);
-            if (!transaction_get(&cfg, sizeof(cfg)))
-                transaction_error();
-            else if (fujicore_net_set_ssid_success(cfg.ssid, cfg.password, true).is_error())
-                transaction_error();
-            else
-                transaction_complete();
-        }
-        break;
-    case FUJICMD_GET_SSID:
-        fujicmd_net_get_ssid();
-        break;
-    case FUJICMD_READ_HOST_SLOTS:
-        fujicmd_read_host_slots();
-        break;
-    case FUJICMD_READ_DEVICE_SLOTS:
-        fujicmd_read_device_slots();
-        break;
-    case FUJICMD_WRITE_DEVICE_SLOTS:
-        fujicmd_write_device_slots();
-        break;
-    case FUJICMD_WRITE_HOST_SLOTS:
-        fujicmd_write_host_slots();
-        break;
-    case FUJICMD_GET_WIFI_ENABLED:
-        fujicmd_net_get_wifi_enabled();
-        break;
-    case FUJICMD_GET_WIFISTATUS:
-        fujicmd_net_get_wifi_status();
-        break;
-    case FUJICMD_MOUNT_HOST:
-        fujicmd_mount_host_success(packet.param8(0));
-        break;
-    case FUJICMD_OPEN_DIRECTORY:
-        fujicmd_open_directory_success(packet.param(0));
-        break;
-    case FUJICMD_CLOSE_DIRECTORY:
-        fujicmd_close_directory();
-        break;
-    case FUJICMD_READ_DIR_ENTRY:
-        fujicmd_read_directory_entry(packet.param8(0), packet.param(1));
-        break;
-    case FUJICMD_SET_DIRECTORY_POSITION:
-        fujicmd_set_directory_position(packet.param(0));
-        break;
-    case FUJICMD_SET_DEVICE_FULLPATH:
-        fujicmd_set_device_filename_success(packet.param(0), packet.param(1),
-                                            (disk_access_flags_t) packet.param8(2));
-        break;
-    case FUJICMD_GET_DEVICE_FULLPATH:
-        fujicmd_get_device_filename(packet.param(0));
-        break;
-    case FUJICMD_MOUNT_IMAGE:
-        fujicmd_mount_disk_image_success(packet.param(0),
-                                         (disk_access_flags_t) packet.param8(1));
-        break;
-    case FUJICMD_UNMOUNT_HOST:
-        fujicmd_unmount_host_success(packet.param(0));
-        break;
-    case FUJICMD_UNMOUNT_IMAGE:
-        fujicmd_unmount_disk_image_success(packet.param(0));
-        break;
-    case FUJICMD_NEW_DISK:
+    case CMD::FUJI_NEW_DISK:
         new_disk();
-        break;
-    case FUJICMD_OPEN_APPKEY:
-        fujicmd_open_app_key();
-        break;
-    case FUJICMD_CLOSE_APPKEY:
-        fujicmd_close_app_key();
-        break;
-    case FUJICMD_READ_APPKEY:
-        fujicmd_read_app_key();
-        break;
-    case FUJICMD_WRITE_APPKEY:
-        // fujinet-lib always sends MAX_APPKEY_LEN data bytes
-        // regardless of len. Drain the full payload so leftover
-        // bytes don't get interpreted as bus opcodes.
-        fujicmd_write_app_key(packet.param(0), MAX_APPKEY_LEN);
-        break;
-    case FUJICMD_RANDOM_NUMBER:
-        random();
-        break;
-    case FUJICMD_SET_BOOT_MODE:
-        fujicmd_set_boot_mode(packet.param(0), MEDIATYPE_UNKNOWN, &bootdisk);
-        break;
-    case FUJICMD_MOUNT_ALL:
-        fujicmd_mount_all_success();
-        break;
-    case FUJICMD_GET_HOST_PREFIX:
-        fujicmd_get_host_prefix(packet.param(0));
-        break;
-    case FUJICMD_SET_HOST_PREFIX:
-        fujicmd_set_host_prefix(packet.param(0));
-        break;
-    case FUJICMD_COPY_FILE:
-        {
-            uint8_t source = packet.param(0);
-            uint8_t dest = packet.param(1);
-            char dirpath[256];
-            transaction_begin(TRANS_STATE::WILL_GET);
-            transaction_get(dirpath, sizeof(dirpath));
-            if (fujicore_copy_file_success(source, dest, dirpath).is_error())
-                transaction_error();
-            else
-                transaction_complete();
-        }
-        break;
-    case FUJICMD_GENERATE_GUID:
-        fujicmd_generate_guid();
-        break;
-    case FUJICMD_STATUS:
-        fujicmd_status();
-        break;
-    case FUJICMD_GET_DIRECTORY_POSITION:
-        fujicmd_get_directory_position();
         break;
     default:
         return false;
@@ -375,44 +242,44 @@ success_is_true drivewireFuji::fujicore_mount_disk_image_success(uint8_t deviceS
     RETURN_SUCCESS_AS_TRUE();
 }
 
-std::optional<std::vector<uint8_t>> drivewireFuji::fujicore_read_app_key()
+ByteBuffer drivewireFuji::appkey_read()
 {
-    auto result = fujiDevice::fujicore_read_app_key();
-
-    if (result)
-    {
-        uint16_t len = htobe16(result->size());
-        result->resize(MAX_APPKEY_LEN, 0);
-        const uint8_t *len_bytes = reinterpret_cast<const uint8_t*>(&len);
-        result->insert(result->begin(), len_bytes, len_bytes + sizeof(len));
-    }
-
+    u16ne_t len;
+    auto result = fujiDevice::appkey_read();
+    len = htole16(result.size());
+    result.resize(MAX_APPKEY_LEN, 0);
+    const uint8_t *len_bytes = reinterpret_cast<const uint8_t*>(&len);
+    result.insert(result.begin(), len_bytes, len_bytes + sizeof(len));
     return result;
 }
 
-void drivewireFuji::fujicmd_open_app_key()
+void drivewireFuji::appkey_write(const FUJI_COMMAND_PACKET &packet)
 {
-    // fujinet-lib for coco sends appkey creator with backwards
-    // endianness, we'll fix it here
+    SYSTEM_BUS.transaction_accept(TRANS_STATE::WILL_GET);
 
-    transaction_begin(TRANS_STATE::WILL_GET);
-    Debug_print("Fuji cmd: OPEN APPKEY\n");
+    uint16_t keylen = packet.param(0);
 
-    appkey key;
-
-    // The data expected for this command
-    if (!transaction_get(&key, sizeof(key)))
+    // The controller always sends a fixed MAX_APPKEY_LEN payload with the real
+    // length in the params. Draining fewer bytes leaves the rest in the stream
+    // and desyncs the bus, so always read the full block and keep only keylen.
+    ByteBuffer keydata(MAX_APPKEY_LEN);
+    if (!SYSTEM_BUS.transaction_get(keydata.data(), keydata.size()))
     {
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         return;
     }
 
-    if (!fujicore_open_app_key(be16toh(key.creator), key.app, key.key, key.mode, key.reserved))
+    if (keylen > MAX_APPKEY_LEN)
+        keylen = MAX_APPKEY_LEN;
+    keydata.resize(keylen);
+
+    if (fujiDevice::appkey_write(keydata).is_error())
     {
-        transaction_error();
+        SYSTEM_BUS.transaction_error();
         return;
     }
-    transaction_complete();
+
+    SYSTEM_BUS.transaction_success();
 }
 
 #endif /* BUILD_COCO */
