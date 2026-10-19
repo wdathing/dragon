@@ -453,6 +453,14 @@ uint8_t WiFiManager::scan_networks(uint8_t maxresults)
     if (temporary_disconnect == true)
         esp_wifi_connect();
 
+    // esp_wifi_scan_start() above blocks until the scan is done, so by now
+    // it genuinely is - unlike the async WIFI_EVENT_SCAN_DONE path, nothing
+    // else will ever clear this flag for us. Left set, a disconnect during
+    // any later connection attempt permanently defers to reconnect_later()
+    // instead of actually reconnecting, since its own timer callback just
+    // re-arms itself for as long as this stays true.
+    _scan_in_progress = false;
+
     return final_count;
 }
 
