@@ -67,6 +67,14 @@ fujiDevice::fujiDevice(unsigned int numDisk, std::string extension,
             fujicmd_net_scan_networks();
         } },
         { CMD::FUJI_SET_SSID, [this](const FUJI_COMMAND_PACKET &packet) {
+            // fujinet-lib's fuji_set_ssid() always sends one (unused, hardcoded
+            // to 0) aux byte ahead of the NetConfig data - FUJICALL_A1_D, not
+            // FUJICALL_D - so it has to be read and discarded here the same
+            // way every other aux-carrying command below does with
+            // packet.param(0), or it's left sitting in the stream for
+            // transaction_get() to read as the first byte of the SSID itself,
+            // landing as a leading NUL and making it an empty string.
+            (void)(uint8_t) packet.param(0);
             fujicmd_net_set_ssid_success();
         } },
         { CMD::FUJI_GET_SSID, [this](const FUJI_COMMAND_PACKET &packet) {
